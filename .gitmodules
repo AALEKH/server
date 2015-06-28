@@ -1,0 +1,3 @@
+[submodule "plugin/InnoDB-Redis/cpp-hiredis-cluster"]
+	path = plugin/InnoDB-Redis/cpp-hiredis-cluster
+	url = https://github.com/shinberg/cpp-hiredis-cluster.git
