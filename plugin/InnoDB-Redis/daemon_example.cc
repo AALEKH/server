@@ -17,12 +17,25 @@
 #include <my_global.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdio.h>
+#include <iostream>
+#include <queue>
+#include <thread>
+#include <assert.h>
 #include <mysql_version.h>
 #include <mysql/plugin.h>
 #include <my_dir.h>
 #include "my_thread.h"
 #include "my_sys.h"                             // my_write, my_malloc
 #include "sql_plugin.h"                         // st_plugin_int
+
+#include "cpp-hiredis-cluster/include/hirediscommand.h" //Redis Cluster library
+
+using namespace RedisCluster;
+using std::string;
+using std::cout;
+using std::cerr;
+using std::endl;
 
 PSI_memory_key key_memory_mysql_innodb_redis_context;
 
@@ -85,7 +98,8 @@ static int innodb_redis_plugin_init(void *p)
   /*
   InnoDB Redis Initialization function
   */
-
+  system("redis-3.0/utils/create-cluster/create-six start");
+  system("redis-3.0/utils/create-cluster/create-six create");
   plugin->data= (void *)con;
 
   DBUG_RETURN(0);
@@ -110,6 +124,7 @@ static int innodb_redis_plugin_deinit(void *p)
   DBUG_ENTER("innodb_redis_plugin_deinit");
 
   // InnoDB Redis deinitialization plugin
+  system("redis-3.0/utils/create-cluster/create-six stop");
   DBUG_RETURN(0);
 }
 
