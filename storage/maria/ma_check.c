@@ -3103,7 +3103,7 @@ int maria_sort_index(HA_CHECK *param, register MARIA_HA *info, char *name)
   fn_format(param->temp_filename,name,"", MARIA_NAME_IEXT,2+4+32);
   if ((new_file=mysql_file_create(key_file_kfile, fn_format(param->temp_filename,param->temp_filename,
 				    "", INDEX_TMP_EXT,2+4),
-			  0,param->tmpfile_createflag,MYF(0))) <= 0)
+                                  0, param->tmpfile_createflag, MYF(0))) < 0)
   {
     _ma_check_print_error(param,"Can't create new tempfile: '%s'",
 			 param->temp_filename);
@@ -3117,10 +3117,8 @@ int maria_sort_index(HA_CHECK *param, register MARIA_HA *info, char *name)
   for (key= 0,keyinfo= &share->keyinfo[0]; key < share->base.keys ;
        key++,keyinfo++)
   {
-    if (! maria_is_key_active(share->state.key_map, key))
-      continue;
-
-    if (share->state.key_root[key] != HA_OFFSET_ERROR)
+    if (maria_is_key_active(share->state.key_map, key) &&
+        share->state.key_root[key] != HA_OFFSET_ERROR)
     {
       index_pos[key]=param->new_file_pos;	/* Write first block here */
       if (sort_one_index(param,info,keyinfo,share->state.key_root[key],
@@ -4021,8 +4019,9 @@ int maria_repair_by_sort(HA_CHECK *param, register MARIA_HA *info,
       share->state.state.data_file_length=sort_param.max_pos;
 
     param->read_cache.file= info->dfile.file;	/* re-init read cache */
-    reinit_io_cache(&param->read_cache,READ_CACHE,share->pack.header_length,
-                    1,1);
+    if (share->data_file_type != BLOCK_RECORD)
+      reinit_io_cache(&param->read_cache, READ_CACHE,
+                      share->pack.header_length, 1, 1);
   }
 
   if (param->testflag & T_WRITE_LOOP)
@@ -4267,20 +4266,14 @@ int maria_repair_parallel(HA_CHECK *param, register MARIA_HA *info,
 
   if (!(sort_info.key_block=
 	alloc_key_blocks(param, (uint) param->sort_key_blocks,
-			 share->base.max_key_block_length)) ||
-      init_io_cache(&param->read_cache, info->dfile.file,
-                    (uint) param->read_buffer_length,
-                    READ_CACHE, share->pack.header_length, 1, MYF(MY_WME)) ||
-      (!rep_quick &&
-       (init_io_cache(&info->rec_cache, info->dfile.file,
-                      (uint) param->write_buffer_length,
-                      WRITE_CACHE, new_header_length, 1,
-                      MYF(MY_WME | MY_WAIT_IF_FULL) & param->myf_rw) ||
-        init_io_cache(&new_data_cache, -1,
-                      (uint) param->write_buffer_length,
-                      READ_CACHE, new_header_length, 1,
-                      MYF(MY_WME | MY_DONT_CHECK_FILESIZE)))))
+			 share->base.max_key_block_length)))
     goto err;
+
+  if (init_io_cache(&param->read_cache, info->dfile.file,
+                    (uint) param->read_buffer_length,
+                    READ_CACHE, share->pack.header_length, 1, MYF(MY_WME)))
+    goto err;
+
   sort_info.key_block_end=sort_info.key_block+param->sort_key_blocks;
   info->opt_flag|=WRITE_CACHE_USED;
   info->rec_cache.file= info->dfile.file;         /* for sort_delete_record */
@@ -4307,7 +4300,19 @@ int maria_repair_parallel(HA_CHECK *param, register MARIA_HA *info,
     if (param->testflag & T_UNPACK)
       restore_data_file_type(share);
     share->state.dellink= HA_OFFSET_ERROR;
-    info->rec_cache.file=new_file;
+
+    if (init_io_cache(&new_data_cache, -1,
+                        (uint) param->write_buffer_length,
+                        READ_CACHE, new_header_length, 1,
+                        MYF(MY_WME | MY_DONT_CHECK_FILESIZE)))
+      goto err;
+
+    if (init_io_cache(&info->rec_cache, new_file,
+                        (uint) param->write_buffer_length,
+                        WRITE_CACHE, new_header_length, 1,
+                        MYF(MY_WME | MY_WAIT_IF_FULL) & param->myf_rw))
+      goto err;
+
   }
 
   /* Optionally drop indexes and optionally modify the key_map. */
@@ -6630,17 +6635,6 @@ static void copy_data_file_state(MARIA_STATE_INFO *to,
 }
 
 
-/* Return 1 if block is full of zero's */
-
-static my_bool zero_filled_block(uchar *tmp, uint length)
-{
-  while (length--)
-    if (*(tmp++) != 0)
-      return 0;
-  return 1;
-}
-
-
 /*
   Read 'safely' next record while scanning table.
 
@@ -6748,8 +6742,7 @@ read_next_page:
             sometimes be found at end of a bitmap when we wrote a big
             record last that was moved to the next bitmap.
           */
-          if (!zero_filled_block(info->scan.page_buff, share->block_size) ||
-              _ma_check_bitmap_data(info, UNALLOCATED_PAGE, 0, 
+          if (_ma_check_bitmap_data(info, UNALLOCATED_PAGE, 0, 
                                     _ma_bitmap_get_page_bits(info,
                                                              &share->bitmap,
                                                              page)))

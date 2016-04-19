@@ -1,4 +1,4 @@
-/* Copyright (c) 2004, 2014, Oracle and/or its affiliates.
+/* Copyright (c) 2004, 2015, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -1648,6 +1648,20 @@ int ha_federated::open(const char *name, int mode, uint test_if_locked)
   DBUG_RETURN(0);
 }
 
+class Net_error_handler : public Internal_error_handler
+{
+public:
+  Net_error_handler() {}
+
+public:
+  bool handle_condition(THD *thd, uint sql_errno, const char* sqlstate,
+                        Sql_condition::enum_warning_level level,
+                        const char* msg, Sql_condition ** cond_hdl)
+  {
+    return sql_errno >= ER_ABORTING_CONNECTION &&
+           sql_errno <= ER_NET_WRITE_INTERRUPTED;
+  }
+};
 
 /*
   Closes a table. We call the free_share() function to free any resources
@@ -1669,18 +1683,15 @@ int ha_federated::close(void)
   delete_dynamic(&results);
 
   /* Disconnect from mysql */
+  THD *thd= ha_thd();
+  Net_error_handler err_handler;
+  if (thd)
+    thd->push_internal_handler(&err_handler);
   mysql_close(mysql);
-  mysql= NULL;
+  if (thd)
+    thd->pop_internal_handler();
 
-  /*
-    mysql_close() might return an error if a remote server's gone
-    for some reason. If that happens while removing a table from
-    the table cache, the error will be propagated to a client even
-    if the original query was not issued against the FEDERATED table.
-    So, don't propagate errors from mysql_close().
-  */
-  if (table->in_use)
-    table->in_use->clear_error();
+  mysql= NULL;
 
   DBUG_RETURN(free_share(share));
 }
@@ -2005,7 +2016,7 @@ void ha_federated::start_bulk_insert(ha_rows rows, uint flags)
   
   @return Operation status
   @retval       0       No error
-  @retval       != 0    Error occured at remote server. Also sets my_errno.
+  @retval       != 0    Error occurred at remote server. Also sets my_errno.
 */
 
 int ha_federated::end_bulk_insert()
@@ -2876,7 +2887,7 @@ int ha_federated::info(uint flag)
 
   }
 
-  if (flag & HA_STATUS_AUTO)
+  if ((flag & HA_STATUS_AUTO) && mysql)
     stats.auto_increment_value= mysql->insert_id;
 
   mysql_free_result(result);

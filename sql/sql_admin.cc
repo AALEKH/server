@@ -1,5 +1,5 @@
-/* Copyright (c) 2010, 2014, Oracle and/or its affiliates.
-   Copyright (c) 2012, 2014, Monty Program Ab.
+/* Copyright (c) 2010, 2015, Oracle and/or its affiliates.
+   Copyright (c) 2011, 2016, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -288,7 +288,8 @@ static inline bool table_not_corrupt_error(uint sql_errno)
           sql_errno == ER_LOCK_WAIT_TIMEOUT ||
           sql_errno == ER_LOCK_DEADLOCK ||
           sql_errno == ER_CANT_LOCK_LOG_TABLE ||
-          sql_errno == ER_OPEN_AS_READONLY);
+          sql_errno == ER_OPEN_AS_READONLY ||
+          sql_errno == ER_WRONG_OBJECT);
 }
 
 
@@ -309,7 +310,8 @@ static bool mysql_admin_table(THD* thd, TABLE_LIST* tables,
                                                   HA_CHECK_OPT *),
                               int (handler::*operator_func)(THD *,
                                                             HA_CHECK_OPT *),
-                              int (view_operator_func)(THD *, TABLE_LIST*))
+                              int (view_operator_func)(THD *, TABLE_LIST*,
+                                                       HA_CHECK_OPT *))
 {
   TABLE_LIST *table;
   SELECT_LEX *select= &thd->lex->select_lex;
@@ -325,14 +327,20 @@ static bool mysql_admin_table(THD* thd, TABLE_LIST* tables,
   DBUG_ENTER("mysql_admin_table");
   DBUG_PRINT("enter", ("extra_open_options: %u", extra_open_options));
 
-  field_list.push_back(item = new Item_empty_string("Table", NAME_CHAR_LEN*2));
+  field_list.push_back(item= new (thd->mem_root)
+                       Item_empty_string(thd, "Table",
+                                         NAME_CHAR_LEN * 2), thd->mem_root);
   item->maybe_null = 1;
-  field_list.push_back(item = new Item_empty_string("Op", 10));
+  field_list.push_back(item= new (thd->mem_root)
+                       Item_empty_string(thd, "Op", 10), thd->mem_root);
   item->maybe_null = 1;
-  field_list.push_back(item = new Item_empty_string("Msg_type", 10));
+  field_list.push_back(item= new (thd->mem_root)
+                       Item_empty_string(thd, "Msg_type", 10), thd->mem_root);
   item->maybe_null = 1;
-  field_list.push_back(item = new Item_empty_string("Msg_text",
-                                                    SQL_ADMIN_MSG_TEXT_SIZE));
+  field_list.push_back(item= new (thd->mem_root)
+                       Item_empty_string(thd, "Msg_text",
+                                         SQL_ADMIN_MSG_TEXT_SIZE),
+                       thd->mem_root);
   item->maybe_null = 1;
   if (protocol->send_result_set_metadata(&field_list,
                             Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF))
@@ -361,6 +369,7 @@ static bool mysql_admin_table(THD* thd, TABLE_LIST* tables,
     char* db = table->db;
     bool fatal_error=0;
     bool open_error;
+    bool collect_eis=  FALSE;
 
     DBUG_PRINT("admin", ("table: '%s'.'%s'", table->db, table->table_name));
     strxmov(table_name, db, ".", table->table_name, NullS);
@@ -392,8 +401,25 @@ static bool mysql_admin_table(THD* thd, TABLE_LIST* tables,
       lex->query_tables_last= &table->next_global;
       lex->query_tables_own_last= 0;
 
-      if (view_operator_func == NULL)
+      /*
+        CHECK TABLE command is allowed for views as well. Check on alter flags
+        to differentiate from ALTER TABLE...CHECK PARTITION on which view is not
+        allowed.
+      */
+      if (lex->alter_info.flags & Alter_info::ALTER_ADMIN_PARTITION ||
+          view_operator_func == NULL)
+      {
         table->required_type=FRMTYPE_TABLE;
+        DBUG_ASSERT(!lex->only_view);
+      }
+      else if (lex->only_view)
+      {
+        table->required_type= FRMTYPE_VIEW;
+      }
+      else if (!lex->only_view && lex->sql_command == SQLCOM_REPAIR)
+      {
+        table->required_type= FRMTYPE_TABLE;
+      }
 
       if (lex->sql_command == SQLCOM_CHECK ||
           lex->sql_command == SQLCOM_REPAIR ||
@@ -484,7 +510,7 @@ static bool mysql_admin_table(THD* thd, TABLE_LIST* tables,
             protocol->store(operator_name, system_charset_info);
             protocol->store(STRING_WITH_LEN("error"), system_charset_info);
             length= my_snprintf(buff, sizeof(buff),
-                                ER(ER_DROP_PARTITION_NON_EXISTENT),
+                                ER_THD(thd, ER_DROP_PARTITION_NON_EXISTENT),
                                 table_name);
             protocol->store(buff, length, system_charset_info);
             if(protocol->write())
@@ -521,9 +547,9 @@ static bool mysql_admin_table(THD* thd, TABLE_LIST* tables,
     }
 
     /*
-      CHECK TABLE command is only command where VIEW allowed here and this
-      command use only temporary teble method for VIEWs resolving => there
-      can't be VIEW tree substitition of join view => if opening table
+      CHECK/REPAIR TABLE command is only command where VIEW allowed here and
+      this command use only temporary table method for VIEWs resolving =>
+      there can't be VIEW tree substitition of join view => if opening table
       succeed then table->table will have real TABLE pointer as value (in
       case of join view substitution table->table can be 0, but here it is
       impossible)
@@ -533,12 +559,13 @@ static bool mysql_admin_table(THD* thd, TABLE_LIST* tables,
       DBUG_PRINT("admin", ("open table failed"));
       if (thd->get_stmt_da()->is_warning_info_empty())
         push_warning(thd, Sql_condition::WARN_LEVEL_WARN,
-                     ER_CHECK_NO_SUCH_TABLE, ER(ER_CHECK_NO_SUCH_TABLE));
+                     ER_CHECK_NO_SUCH_TABLE,
+                     ER_THD(thd, ER_CHECK_NO_SUCH_TABLE));
       /* if it was a view will check md5 sum */
       if (table->view &&
-          view_checksum(thd, table) == HA_ADMIN_WRONG_CHECKSUM)
+          view_check(thd, table, check_opt) == HA_ADMIN_WRONG_CHECKSUM)
         push_warning(thd, Sql_condition::WARN_LEVEL_WARN,
-                     ER_VIEW_CHECKSUM, ER(ER_VIEW_CHECKSUM));
+                     ER_VIEW_CHECKSUM, ER_THD(thd, ER_VIEW_CHECKSUM));
       if (thd->get_stmt_da()->is_error() &&
           table_not_corrupt_error(thd->get_stmt_da()->sql_errno()))
         result_code= HA_ADMIN_FAILED;
@@ -551,7 +578,7 @@ static bool mysql_admin_table(THD* thd, TABLE_LIST* tables,
     if (table->view)
     {
       DBUG_PRINT("admin", ("calling view_operator_func"));
-      result_code= (*view_operator_func)(thd, table);
+      result_code= (*view_operator_func)(thd, table, check_opt);
       goto send_result;
     }
 
@@ -572,7 +599,7 @@ static bool mysql_admin_table(THD* thd, TABLE_LIST* tables,
       protocol->store(table_name, system_charset_info);
       protocol->store(operator_name, system_charset_info);
       protocol->store(STRING_WITH_LEN("error"), system_charset_info);
-      length= my_snprintf(buff, sizeof(buff), ER(ER_OPEN_AS_READONLY),
+      length= my_snprintf(buff, sizeof(buff), ER_THD(thd, ER_OPEN_AS_READONLY),
                           table_name);
       protocol->store(buff, length, system_charset_info);
       trans_commit_stmt(thd);
@@ -671,34 +698,64 @@ static bool mysql_admin_table(THD* thd, TABLE_LIST* tables,
       {
         compl_result_code= result_code= HA_ADMIN_INVALID;
       }
+      collect_eis=
+        (table->table->s->table_category == TABLE_CATEGORY_USER &&
+         (get_use_stat_tables_mode(thd) > NEVER ||
+          lex->with_persistent_for_clause));
 
-      if (!lex->column_list)
-      { 
-        uint fields= 0;
-        for ( ; *field_ptr; field_ptr++, fields++) ;         
-        bitmap_set_prefix(tab->read_set, fields);
+      if (collect_eis)
+      {
+        if (!lex->column_list)
+        {
+          bitmap_clear_all(tab->read_set);
+          for (uint fields= 0; *field_ptr; field_ptr++, fields++)
+          {
+            enum enum_field_types type= (*field_ptr)->type();
+            if (type < MYSQL_TYPE_MEDIUM_BLOB ||
+                type > MYSQL_TYPE_BLOB)
+              bitmap_set_bit(tab->read_set, fields);
+            else if (collect_eis)
+              push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
+                                  ER_NO_EIS_FOR_FIELD,
+                                  ER_THD(thd, ER_NO_EIS_FOR_FIELD),
+                                  (*field_ptr)->field_name);
+          }
+        }
+        else
+        {
+          int pos;
+          LEX_STRING *column_name;
+          List_iterator_fast<LEX_STRING> it(*lex->column_list);
+
+          bitmap_clear_all(tab->read_set);
+          while ((column_name= it++))
+          {
+            if (tab->s->fieldnames.type_names == 0 ||
+                (pos= find_type(&tab->s->fieldnames, column_name->str,
+                                column_name->length, 1)) <= 0)
+            {
+              compl_result_code= result_code= HA_ADMIN_INVALID;
+              break;
+            }
+            pos--;
+            enum enum_field_types type= tab->field[pos]->type();
+            if (type < MYSQL_TYPE_MEDIUM_BLOB ||
+                type > MYSQL_TYPE_BLOB)
+              bitmap_set_bit(tab->read_set, pos);
+            else if (collect_eis)
+              push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
+                                  ER_NO_EIS_FOR_FIELD,
+                                  ER_THD(thd, ER_NO_EIS_FOR_FIELD),
+                                  column_name->str);
+          }
+          tab->file->column_bitmaps_signal(); 
+        }
       }
       else
       {
-        int pos;
-        LEX_STRING *column_name;
-        List_iterator_fast<LEX_STRING> it(*lex->column_list);
-
-        bitmap_clear_all(tab->read_set);
-        while ((column_name= it++))
-	{
-          if (tab->s->fieldnames.type_names == 0 ||
-              (pos= find_type(&tab->s->fieldnames, column_name->str,
-                              column_name->length, 1)) <= 0)
-          {
-            compl_result_code= result_code= HA_ADMIN_INVALID;
-            break;
-          }
-          bitmap_set_bit(tab->read_set, pos-1);
-        } 
-        tab->file->column_bitmaps_signal(); 
+        DBUG_ASSERT(!lex->column_list);
       }
-      
+
       if (!lex->index_list)
       {
         tab->keys_in_use_for_query.init(tab->s->keys);
@@ -733,11 +790,7 @@ static bool mysql_admin_table(THD* thd, TABLE_LIST* tables,
       DBUG_PRINT("admin", ("operator_func returned: %d", result_code));
     }
 
-    if (compl_result_code == HA_ADMIN_OK &&
-        operator_func == &handler::ha_analyze && 
-        table->table->s->table_category == TABLE_CATEGORY_USER &&
-        (get_use_stat_tables_mode(thd) > NEVER ||
-         lex->with_persistent_for_clause)) 
+    if (compl_result_code == HA_ADMIN_OK && collect_eis)
     {
       if (!(compl_result_code=
             alloc_statistics_for_table(thd, table->table)) &&
@@ -801,7 +854,8 @@ send_result_message:
       {
        char buf[MYSQL_ERRMSG_SIZE];
        size_t length=my_snprintf(buf, sizeof(buf),
-				ER(ER_CHECK_NOT_IMPLEMENTED), operator_name);
+                                 ER_THD(thd, ER_CHECK_NOT_IMPLEMENTED),
+                                 operator_name);
 	protocol->store(STRING_WITH_LEN("note"), system_charset_info);
 	protocol->store(buf, length, system_charset_info);
       }
@@ -811,7 +865,8 @@ send_result_message:
       {
         char buf[MYSQL_ERRMSG_SIZE];
         size_t length= my_snprintf(buf, sizeof(buf),
-                                 ER(ER_BAD_TABLE_ERROR), table_name);
+                                   ER_THD(thd, ER_BAD_TABLE_ERROR),
+                                   table_name);
         protocol->store(STRING_WITH_LEN("note"), system_charset_info);
         protocol->store(buf, length, system_charset_info);
       }
@@ -956,7 +1011,8 @@ send_result_message:
     case HA_ADMIN_WRONG_CHECKSUM:
     {
       protocol->store(STRING_WITH_LEN("note"), system_charset_info);
-      protocol->store(ER(ER_VIEW_CHECKSUM), strlen(ER(ER_VIEW_CHECKSUM)),
+      protocol->store(ER_THD(thd, ER_VIEW_CHECKSUM),
+                      strlen(ER_THD(thd, ER_VIEW_CHECKSUM)),
                       system_charset_info);
       break;
     }
@@ -966,13 +1022,17 @@ send_result_message:
     {
       char buf[MYSQL_ERRMSG_SIZE];
       size_t length;
+      const char *what_to_upgrade= table->view ? "VIEW" :
+          table->table->file->ha_table_flags() & HA_CAN_REPAIR ? "TABLE" : 0;
 
       protocol->store(STRING_WITH_LEN("error"), system_charset_info);
-      if (table->table->file->ha_table_flags() & HA_CAN_REPAIR)
-        length= my_snprintf(buf, sizeof(buf), ER(ER_TABLE_NEEDS_UPGRADE),
-                            table->table_name);
+      if (what_to_upgrade)
+        length= my_snprintf(buf, sizeof(buf),
+                            ER_THD(thd, ER_TABLE_NEEDS_UPGRADE),
+                            what_to_upgrade, table->table_name);
       else
-        length= my_snprintf(buf, sizeof(buf), ER(ER_TABLE_NEEDS_REBUILD),
+        length= my_snprintf(buf, sizeof(buf),
+                            ER_THD(thd, ER_TABLE_NEEDS_REBUILD),
                             table->table_name);
       protocol->store(buf, length, system_charset_info);
       fatal_error=1;
@@ -991,7 +1051,7 @@ send_result_message:
         break;
       }
     }
-    if (table->table)
+    if (table->table && !table->view)
     {
       if (table->table->s->tmp_table)
       {
@@ -1154,9 +1214,8 @@ bool Sql_cmd_analyze_table::execute(THD *thd)
   if (check_table_access(thd, SELECT_ACL | INSERT_ACL, first_table,
                          FALSE, UINT_MAX, FALSE))
     goto error;
+  WSREP_TO_ISOLATION_BEGIN_WRTCHK(NULL, NULL, first_table);
   thd->enable_slow_log= opt_log_slow_admin_statements;
-  WSREP_TO_ISOLATION_BEGIN(first_table->db, first_table->table_name, NULL);
-
   res= mysql_admin_table(thd, first_table, &m_lex->check_opt,
                          "analyze", lock_type, 1, 0, 0, 0,
                          &handler::ha_analyze, 0);
@@ -1191,7 +1250,7 @@ bool Sql_cmd_check_table::execute(THD *thd)
 
   res= mysql_admin_table(thd, first_table, &m_lex->check_opt, "check",
                          lock_type, 0, 0, HA_OPEN_FOR_REPAIR, 0,
-                         &handler::ha_check, &view_checksum);
+                         &handler::ha_check, &view_check);
 
   m_lex->select_lex.table_list.first= first_table;
   m_lex->query_tables= first_table;
@@ -1211,7 +1270,7 @@ bool Sql_cmd_optimize_table::execute(THD *thd)
   if (check_table_access(thd, SELECT_ACL | INSERT_ACL, first_table,
                          FALSE, UINT_MAX, FALSE))
     goto error; /* purecov: inspected */
-  WSREP_TO_ISOLATION_BEGIN(first_table->db, first_table->table_name, NULL)
+  WSREP_TO_ISOLATION_BEGIN_WRTCHK(NULL, NULL, first_table);
   thd->enable_slow_log= opt_log_slow_admin_statements;
   res= (specialflag & SPECIAL_NO_NEW_FUNC) ?
     mysql_recreate_table(thd, first_table, true) :
@@ -1245,12 +1304,12 @@ bool Sql_cmd_repair_table::execute(THD *thd)
                          FALSE, UINT_MAX, FALSE))
     goto error; /* purecov: inspected */
   thd->enable_slow_log= opt_log_slow_admin_statements;
-  WSREP_TO_ISOLATION_BEGIN(first_table->db, first_table->table_name, NULL)
+  WSREP_TO_ISOLATION_BEGIN_WRTCHK(NULL, NULL, first_table);
   res= mysql_admin_table(thd, first_table, &m_lex->check_opt, "repair",
                          TL_WRITE, 1,
                          MY_TEST(m_lex->check_opt.sql_flags & TT_USEFRM),
                          HA_OPEN_FOR_REPAIR, &prepare_for_repair,
-                         &handler::ha_repair, 0);
+                         &handler::ha_repair, &view_repair);
 
   /* ! we write after unlocking the table */
   if (!res && !m_lex->no_write_to_binlog)

@@ -2,7 +2,7 @@
 #define ITEM_ROW_INCLUDED
 
 /*
-   Copyright (c) 2002, 2010, Oracle and/or its affiliates.
+   Copyright (c) 2002, 2013, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -28,17 +28,27 @@
   @endverbatim
 */
 
+
+/**
+   Item which stores (x,y,...) and ROW(x,y,...).
+   Note that this can be recursive: ((x,y),(z,t)) is a ROW of ROWs.
+*/
 class Item_row: public Item,
                 private Item_args,
                 private Used_tables_and_const_cache
 {
   table_map not_null_tables_cache;
+  /**
+    If elements are made only of constants, of which one or more are
+    NULL. For example, this item is (1,2,NULL), or ( (1,NULL), (2,3) ).
+  */
   bool with_null;
 public:
-  Item_row(List<Item> &list)
-   :Item_args(list), not_null_tables_cache(0), with_null(0)
+  Item_row(THD *thd, List<Item> &list):
+  Item(thd), Item_args(thd, list), not_null_tables_cache(0), with_null(0)
   { }
-  Item_row(Item_row *item):
+  Item_row(THD *thd, Item_row *item):
+    Item(thd),
     Item_args(item),
     Used_tables_and_const_cache(item),
     not_null_tables_cache(0),
@@ -75,7 +85,8 @@ public:
   bool fix_fields(THD *thd, Item **ref);
   void fix_after_pullout(st_select_lex *new_parent, Item **ref);
   void cleanup();
-  void split_sum_func(THD *thd, Item **ref_pointer_array, List<Item> &fields);
+  void split_sum_func(THD *thd, Item **ref_pointer_array, List<Item> &fields,
+                      uint flags);
   table_map used_tables() const { return used_tables_cache; };
   bool const_item() const { return const_item_cache; };
   enum Item_result result_type() const { return ROW_RESULT; }
@@ -94,7 +105,7 @@ public:
       return true;
     return (this->*processor)(arg);
   }
-  Item *transform(Item_transformer transformer, uchar *arg);
+  Item *transform(THD *thd, Item_transformer transformer, uchar *arg);
   bool eval_not_null_tables(uchar *opt_arg);
 
   uint cols() { return arg_count; }

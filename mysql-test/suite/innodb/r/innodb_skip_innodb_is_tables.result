@@ -224,7 +224,7 @@ index_page_reorg_attempts	index	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL
 index_page_reorg_successful	index	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NULL	disabled	counter	Number of successful index page reorganizations
 index_page_discards	index	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NULL	disabled	counter	Number of index pages discarded
 adaptive_hash_searches	adaptive_hash_index	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NULL	disabled	status_counter	Number of successful searches using Adaptive Hash Index
-adaptive_hash_searches_btree	adaptive_hash_index	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NULL	disabled	counter	Number of searches using B-tree on an index search
+adaptive_hash_searches_btree	adaptive_hash_index	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NULL	disabled	status_counter	Number of searches using B-tree on an index search
 adaptive_hash_pages_added	adaptive_hash_index	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NULL	disabled	counter	Number of index pages on which the Adaptive Hash Index is built
 adaptive_hash_pages_removed	adaptive_hash_index	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NULL	disabled	counter	Number of index pages whose corresponding Adaptive Hash Index entries were removed
 adaptive_hash_rows_added	adaptive_hash_index	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NULL	disabled	counter	Number of Adaptive Hash Index rows added
@@ -250,6 +250,8 @@ innodb_log_flush_usec	server	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NU
 innodb_mem_validate_usec	server	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NULL	disabled	counter	Time (in microseconds) spent to do memory validation
 innodb_master_purge_usec	server	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NULL	disabled	counter	Time (in microseconds) spent by master thread to purge records
 innodb_dict_lru_usec	server	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NULL	disabled	counter	Time (in microseconds) spent to process DICT LRU list
+innodb_dict_lru_count_active	server	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NULL	disabled	counter	Number of tables evicted from DICT LRU list in the active loop
+innodb_dict_lru_count_idle	server	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NULL	disabled	counter	Number of tables evicted from DICT LRU list in the idle loop
 innodb_checkpoint_usec	server	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NULL	disabled	counter	Time (in microseconds) spent by master thread to do checkpoint
 innodb_dblwr_writes	server	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NULL	disabled	status_counter	Number of doublewrite operations that have been performed (innodb_dblwr_writes)
 innodb_dblwr_pages_written	server	0	NULL	NULL	NULL	0	NULL	NULL	NULL	NULL	NULL	NULL	NULL	disabled	status_counter	Number of pages that have been written for doublewrite operations (innodb_dblwr_pages_written)
@@ -374,7 +376,7 @@ space_id	page_id	start_lsn	end_lsn
 Warnings:
 Warning	1012	InnoDB: SELECTing from INFORMATION_SCHEMA.innodb_changed_pages but the InnoDB storage engine is not installed
 select * from information_schema.innodb_tablespaces_encryption;
-SPACE	NAME	ENCRYPTION_SCHEME	KEYSERVER_REQUESTS	MIN_KEY_VERSION	CURRENT_KEY_VERSION	KEY_ROTATION_PAGE_NUMBER	KEY_ROTATION_MAX_PAGE_NUMBER
+SPACE	NAME	ENCRYPTION_SCHEME	KEYSERVER_REQUESTS	MIN_KEY_VERSION	CURRENT_KEY_VERSION	KEY_ROTATION_PAGE_NUMBER	KEY_ROTATION_MAX_PAGE_NUMBER	CURRENT_KEY_ID
 Warnings:
 Warning	1012	InnoDB: SELECTing from INFORMATION_SCHEMA.innodb_tablespaces_encryption but the InnoDB storage engine is not installed
 select * from information_schema.innodb_tablespaces_scrubbing;

@@ -41,10 +41,6 @@
 #include <keycache.h>
 #include <mysql/psi/mysql_table.h>
 
-#if MAX_KEY > 128
-#error MAX_KEY is too large.  Values up to 128 are supported.
-#endif
-
 class Alter_info;
 
 // the following is for checking tables
@@ -949,6 +945,11 @@ struct handler_iterator {
 };
 
 class handler;
+class group_by_handler;
+struct Query;
+typedef class st_select_lex SELECT_LEX;
+typedef struct st_order ORDER;
+
 /*
   handlerton is a singleton structure - one instance per storage engine -
   to provide access to storage engine functionality that works on the
@@ -1251,6 +1252,20 @@ struct handlerton
    */
    const char **tablefile_extensions; // by default - empty list
 
+  /**********************************************************************
+   Functions to intercept queries
+  **********************************************************************/
+
+  /*
+    Create and return a group_by_handler, if the storage engine can execute
+    the summary / group by query.
+    If the storage engine can't do that, return NULL.
+
+    The server guaranteeds that all tables in the list belong to this
+    storage engine.
+  */
+  group_by_handler *(*create_group_by)(THD *thd, Query *query);
+
    /*********************************************************************
      Table discovery API.
      It allows the server to "discover" tables that exist in the storage
@@ -1287,7 +1302,7 @@ struct handlerton
    };
 
    /*
-     By default (if not implemented by the engine, but the discovery_table() is
+     By default (if not implemented by the engine, but the discover_table() is
      implemented) it will perform a file-based discovery:
 
      - if tablefile_extensions[0] is not null, this will discovers all tables
@@ -1740,10 +1755,10 @@ struct Table_specification_st: public HA_CREATE_INFO,
     HA_CREATE_INFO::init();
     DDL_options_st::init();
   }
-  void init(DDL_options_st::Options options)
+  void init(DDL_options_st::Options options_arg)
   {
     HA_CREATE_INFO::init();
-    DDL_options_st::init(options);
+    DDL_options_st::init(options_arg);
   }
   /*
     Quick initialization, for parser.
@@ -3602,7 +3617,7 @@ public:
    *) a) If the previous step succeeds, handler::ha_commit_inplace_alter_table() is
          called to allow the storage engine to do any final updates to its structures,
          to make all earlier changes durable and visible to other connections.
-      b) If we have failed to upgrade lock or any errors have occured during the
+      b) If we have failed to upgrade lock or any errors have occurred during the
          handler functions calls (including commit), we call
          handler::ha_commit_inplace_alter_table()
          to rollback all changes which were done during previous steps.
@@ -4080,6 +4095,7 @@ protected:
 };
 
 #include "multi_range_read.h"
+#include "group_by_handler.h"
 
 bool key_uses_partial_cols(TABLE_SHARE *table, uint keyno);
 

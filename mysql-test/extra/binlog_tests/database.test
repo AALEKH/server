@@ -52,7 +52,7 @@ eval SELECT 'hello' INTO OUTFILE 'fake_file.$prefix';
 
 # Use '/' instead of '\' in the error message. On windows platform, dir is
 # formed with '\'.
---replace_regex /\\testing_1\\*/\/testing_1\// /66/39/
+--replace_regex /\\testing_1\\*/\/testing_1\// /66/39/ /17/39/ /File exists/Directory not empty/
 --error 1010
 DROP DATABASE testing_1;
 let $wait_binlog_event= DROP TABLE IF EXIST;
@@ -84,7 +84,7 @@ CREATE TABLE t3 (a INT, KEY (a), FOREIGN KEY(a) REFERENCES db1.t2(b))
   engine=innodb;
 RESET MASTER;
 
---error ER_ROW_IS_REFERENCED
+--error ER_ROW_IS_REFERENCED_2
 DROP DATABASE db1;                      # Fails because of the fk
 SHOW TABLES FROM db1;                   # t1 was dropped, t2 remains
 --source include/show_binlog_events.inc # Check that the binlog drops t1

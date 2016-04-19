@@ -5,7 +5,7 @@
 /*                                                                      */
 /* AUTHOR:                                                              */
 /* -------                                                              */
-/*  Olivier BERTRAND                                      2007-2014     */
+/*  Olivier BERTRAND                                      2007-2015     */
 /*                                                                      */
 /* WHAT THIS PROGRAM DOES:                                              */
 /* -----------------------                                              */
@@ -35,9 +35,9 @@
 #include "my_global.h"
 #include "sql_class.h"
 #include "sql_servers.h"
-#if defined(WIN32)
+#if defined(__WIN__)
 //#include <windows.h>
-#else   // !WIN32
+#else   // !__WIN__
 //#include <fnmatch.h>
 //#include <errno.h>
 #include <stdlib.h>
@@ -46,7 +46,7 @@
 #include "osutil.h"
 //#include <io.h>
 //#include <fcntl.h>
-#endif  // !WIN32
+#endif  // !__WIN__
 
 /***********************************************************************/
 /*  Include application header files:                                  */
@@ -56,7 +56,6 @@
 #include "xtable.h"
 #include "tabcol.h"
 #include "colblk.h"
-#include "mycat.h"
 #include "reldef.h"
 #include "tabmysql.h"
 #include "valblk.h"
@@ -308,7 +307,7 @@ bool MYSQLDEF::ParseURL(PGLOBAL g, char *url, bool b)
 /***********************************************************************/
 /*  DefineAM: define specific AM block values from XCV file.           */
 /***********************************************************************/
-bool MYSQLDEF::DefineAM(PGLOBAL g, LPCSTR am, int poff)
+bool MYSQLDEF::DefineAM(PGLOBAL g, LPCSTR am, int)
   {
   char *url;
 
@@ -335,7 +334,7 @@ bool MYSQLDEF::DefineAM(PGLOBAL g, LPCSTR am, int poff)
     Delayed = !!GetIntCatInfo("Delayed", 0);
   } else {
     // MYSQL access from a PROXY table 
-    Database = GetStringCatInfo(g, "Database", "*");
+    Database = GetStringCatInfo(g, "Database", Schema ? Schema : PlugDup(g, "*"));
     Isview = GetBoolCatInfo("View", false);
 
     // We must get other connection parms from the calling table
@@ -381,7 +380,7 @@ bool MYSQLDEF::DefineAM(PGLOBAL g, LPCSTR am, int poff)
 /***********************************************************************/
 /*  GetTable: makes a new TDB of the proper type.                      */
 /***********************************************************************/
-PTDB MYSQLDEF::GetTable(PGLOBAL g, MODE m)
+PTDB MYSQLDEF::GetTable(PGLOBAL g, MODE)
   {
   if (Xsrc)
     return new(g) TDBMYEXC(this);
@@ -439,7 +438,7 @@ TDBMYSQL::TDBMYSQL(PMYDEF tdp) : TDBASE(tdp)
   Nparm = 0;
   } // end of TDBMYSQL constructor
 
-TDBMYSQL::TDBMYSQL(PGLOBAL g, PTDBMY tdbp) : TDBASE(tdbp)
+TDBMYSQL::TDBMYSQL(PTDBMY tdbp) : TDBASE(tdbp)
   {
   Host = tdbp->Host;
   Database = tdbp->Database;
@@ -469,7 +468,7 @@ PTDB TDBMYSQL::CopyOne(PTABS t)
   PCOL    cp1, cp2;
   PGLOBAL g = t->G;
 
-  tp = new(g) TDBMYSQL(g, this);
+  tp = new(g) TDBMYSQL(this);
 
   for (cp1 = Columns; cp1; cp1 = cp1->GetNext()) {
     cp2 = new(g) MYSQLCOL((PMYCOL)cp1, tp);
@@ -807,7 +806,7 @@ int TDBMYSQL::GetMaxSize(PGLOBAL g)
     else if (!Cardinality(NULL))
       MaxSize = 10;   // To make MySQL happy
     else if ((MaxSize = Cardinality(g)) < 0)
-      MaxSize = 12;   // So we can see an error occured
+      MaxSize = 12;   // So we can see an error occurred
 
     } // endif MaxSize
 
@@ -817,7 +816,7 @@ int TDBMYSQL::GetMaxSize(PGLOBAL g)
 /***********************************************************************/
 /*  This a fake routine as ROWID does not exist in MySQL.              */
 /***********************************************************************/
-int TDBMYSQL::RowNumber(PGLOBAL g, bool b)
+int TDBMYSQL::RowNumber(PGLOBAL, bool)
   {
   return N + 1;
   } // end of RowNumber
@@ -833,7 +832,7 @@ int TDBMYSQL::GetProgMax(PGLOBAL g)
 /***********************************************************************/
 /*  MySQL Bind Parameter function.                                     */
 /***********************************************************************/
-int TDBMYSQL::BindColumns(PGLOBAL g)
+int TDBMYSQL::BindColumns(PGLOBAL g __attribute__((unused)))
   {
 #if defined(MYSQL_PREPARED_STATEMENTS)
   if (Prep) {
@@ -1055,46 +1054,54 @@ int TDBMYSQL::SendCommand(PGLOBAL g)
 /***********************************************************************/
 /*  Data Base indexed read routine for MYSQL access method.            */
 /***********************************************************************/
-bool TDBMYSQL::ReadKey(PGLOBAL g, OPVAL op, const void *key, int len)
+bool TDBMYSQL::ReadKey(PGLOBAL g, OPVAL op, const key_range *kr)
 {
-  bool oom;
   int  oldlen = Query->GetLength();
+	PHC  hc = To_Def->GetHandler();
 
-  if (!key || op == OP_NEXT ||
-        Mode == MODE_UPDATE || Mode == MODE_DELETE)
+	if (!(kr || hc->end_range) || op == OP_NEXT ||
+         Mode == MODE_UPDATE || Mode == MODE_DELETE) {
+    if (!kr && Mode == MODE_READX) {
+      // This is a false indexed read
+      m_Rc = Myc.ExecSQL(g, Query->GetStr());
+      Mode = MODE_READ;
+      return (m_Rc == RC_FX) ? true : false;
+      } // endif key
+
     return false;
-  else if (op == OP_FIRST) {
-    if (To_CondFil) {
-      oom = Query->Append(" WHERE ");
-
-      if ((oom |= Query->Append(To_CondFil->Body))) {
-        strcpy(g->Message, "Readkey: Out of memory");
-        return true;
-        } // endif oom
-
-      } // endif To_Condfil
-
   } else {
     if (Myc.m_Res)
       Myc.FreeResult();
 
-    To_Def->GetHandler()->MakeKeyWhere(g, Query->GetStr(),
-                                       op, "`", key, len);
+		if (hc->MakeKeyWhere(g, Query, op, '`', kr))
+			return true;
 
     if (To_CondFil) {
-      oom = Query->Append(" AND (");
-      oom |= Query->Append(To_CondFil->Body);
+			if (To_CondFil->Idx != hc->active_index) {
+				To_CondFil->Idx = hc->active_index;
+				To_CondFil->Body= (char*)PlugSubAlloc(g, NULL, 0);
+				*To_CondFil->Body= 0;
 
-      if ((oom |= Query->Append(')'))) {
-        strcpy(g->Message, "Readkey: Out of memory");
-        return true;
-        } // endif oom
+				if ((To_CondFil = hc->CheckCond(g, To_CondFil, To_CondFil->Cond)))
+					PlugSubAlloc(g, NULL, strlen(To_CondFil->Body) + 1);
 
-      } // endif To_Condfil
+				} // endif active_index
 
-  } // endif's op
+			if (To_CondFil)
+				if (Query->Append(" AND ") || Query->Append(To_CondFil->Body)) {
+				  strcpy(g->Message, "Readkey: Out of memory");
+					return true;
+					} // endif Append
 
-  m_Rc = Myc.ExecSQL(g, Query->GetStr());
+			} // endif To_Condfil
+
+		Mode = MODE_READ;
+	} // endif's op
+
+	if (trace)
+		htrc("MYSQL ReadKey: Query=%s\n", Query->GetStr());
+
+	m_Rc = Myc.ExecSQL(g, Query->GetStr());
   Query->Truncate(oldlen);
   return (m_Rc == RC_FX) ? true : false;
 } // end of ReadKey
@@ -1420,7 +1427,7 @@ void MYSQLCOL::ReadColumn(PGLOBAL g)
 /***********************************************************************/
 /*  WriteColumn: make sure the bind buffer is updated.                 */
 /***********************************************************************/
-void MYSQLCOL::WriteColumn(PGLOBAL g)
+void MYSQLCOL::WriteColumn(PGLOBAL)
   {
   /*********************************************************************/
   /*  Do convert the column value if necessary.                        */
@@ -1458,7 +1465,7 @@ TDBMYEXC::TDBMYEXC(PMYDEF tdp) : TDBMYSQL(tdp)
   Nerr = 0;
 } // end of TDBMYEXC constructor
 
-TDBMYEXC::TDBMYEXC(PGLOBAL g, PTDBMYX tdbp) : TDBMYSQL(g, tdbp)
+TDBMYEXC::TDBMYEXC(PTDBMYX tdbp) : TDBMYSQL(tdbp)
 {
   Cmdlist = tdbp->Cmdlist;
   Cmdcol = tdbp->Cmdcol;
@@ -1476,7 +1483,7 @@ PTDB TDBMYEXC::CopyOne(PTABS t)
   PCOL    cp1, cp2;
   PGLOBAL g = t->G;
 
-  tp = new(g) TDBMYEXC(g, this);
+  tp = new(g) TDBMYEXC(this);
 
   for (cp1 = Columns; cp1; cp1 = cp1->GetNext()) {
     cp2 = new(g) MYXCOL((PMYXCOL)cp1, tp);
@@ -1529,7 +1536,7 @@ PCMD TDBMYEXC::MakeCMD(PGLOBAL g)
 /***********************************************************************/
 /*  EXC GetMaxSize: returns the maximum number of rows in the table.   */
 /***********************************************************************/
-int TDBMYEXC::GetMaxSize(PGLOBAL g)
+int TDBMYEXC::GetMaxSize(PGLOBAL)
   {
   if (MaxSize < 0) {
     MaxSize = 10;                 // a guess
@@ -1706,7 +1713,7 @@ void MYXCOL::ReadColumn(PGLOBAL g)
 /***********************************************************************/
 /*  WriteColumn: should never be called.                               */
 /***********************************************************************/
-void MYXCOL::WriteColumn(PGLOBAL g)
+void MYXCOL::WriteColumn(PGLOBAL)
   {
   assert(false);
   } // end of WriteColumn

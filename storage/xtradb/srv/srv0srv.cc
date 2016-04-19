@@ -1,9 +1,9 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2013, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2015, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2008, 2009 Google Inc.
 Copyright (c) 2009, Percona Inc.
-Copyright (c) 2013, 2015, MariaDB Corporation.
+Copyright (c) 2013, 2014, SkySQL Ab. All Rights Reserved.
 
 Portions of this file contain modifications contributed and copyrighted by
 Google, Inc. Those modifications are gratefully acknowledged and are described
@@ -159,6 +159,9 @@ UNIV_INTERN ulint	srv_file_format = 0;
 UNIV_FORMAT_MAX + 1 means no checking ie. FALSE.  The default is to
 set it to the highest format we support. */
 UNIV_INTERN ulint	srv_max_file_format_at_startup = UNIV_FORMAT_MAX;
+/** Set if InnoDB operates in read-only mode or innodb-force-recovery
+is greater than SRV_FORCE_NO_TRX_UNDO. */
+UNIV_INTERN my_bool	high_level_read_only;
 
 #if UNIV_FORMAT_A
 # error "UNIV_FORMAT_A must be 0!"
@@ -177,6 +180,7 @@ OS (provided we compiled Innobase with it in), otherwise we will
 use simulated aio we build below with threads.
 Currently we support native aio on windows and linux */
 UNIV_INTERN my_bool	srv_use_native_aio = TRUE;
+UNIV_INTERN my_bool	srv_numa_interleave = FALSE;
 
 /* Default compression level if page compression is used and no compression
 level is set for the table*/
@@ -282,8 +286,6 @@ UNIV_INTERN const byte*	srv_latin1_ordering;
 UNIV_INTERN my_bool	srv_use_sys_malloc	= TRUE;
 /* requested size in kilobytes */
 UNIV_INTERN ulint	srv_buf_pool_size	= ULINT_MAX;
-/* force virtual page preallocation (prefault) */
-UNIV_INTERN my_bool	srv_buf_pool_populate	= FALSE;
 /* requested number of buffer pool instances */
 UNIV_INTERN ulint       srv_buf_pool_instances  = 1;
 /* number of locks to protect buf_pool->page_hash */
@@ -296,6 +298,8 @@ UNIV_INTERN ulong	srv_flush_neighbors	= 1;
 UNIV_INTERN ulint	srv_buf_pool_old_size;
 /* current size in kilobytes */
 UNIV_INTERN ulint	srv_buf_pool_curr_size	= 0;
+/* dump that may % of each buffer pool during BP dump */
+UNIV_INTERN ulong	srv_buf_pool_dump_pct;
 /* size in bytes */
 UNIV_INTERN ulint	srv_mem_pool_size	= ULINT_MAX;
 UNIV_INTERN ulint	srv_lock_table_size	= ULINT_MAX;
@@ -687,6 +691,9 @@ current_time % 5 != 0. */
 # define	SRV_MASTER_MEM_VALIDATE_INTERVAL	(13)
 #endif /* MEM_PERIODIC_CHECK */
 # define	SRV_MASTER_DICT_LRU_INTERVAL		(47)
+
+/** Buffer pool dump status frequence in percentages */
+UNIV_INTERN ulong srv_buf_dump_status_frequency = 0;
 
 /** Acquire the system_mutex. */
 #define srv_sys_mutex_enter() do {			\
@@ -2351,8 +2358,7 @@ rescan_idle:
 		mutex_enter(&trx_sys->mutex);
 		trx = UT_LIST_GET_FIRST(trx_sys->mysql_trx_list);
 		while (trx) {
-			if (!trx_state_eq(trx, TRX_STATE_NOT_STARTED)
-			    && trx_state_eq(trx, TRX_STATE_ACTIVE)
+			if (trx->state == TRX_STATE_ACTIVE
 			    && trx->mysql_thd
 			    && innobase_thd_is_idle(trx->mysql_thd)) {
 				ib_int64_t	start_time = innobase_thd_get_start_time(trx->mysql_thd);
@@ -2878,6 +2884,7 @@ srv_master_do_active_tasks(void)
 {
 	ib_time_t	cur_time = ut_time();
 	ullint		counter_time = ut_time_us(NULL);
+	ulint		n_evicted = 0;
 
 	/* First do the tasks that we are suppose to do at each
 	invocation of this function. */
@@ -2938,7 +2945,9 @@ srv_master_do_active_tasks(void)
 
 	if (cur_time % SRV_MASTER_DICT_LRU_INTERVAL == 0) {
 		srv_main_thread_op_info = "enforcing dict cache limit";
-		srv_master_evict_from_table_cache(50);
+		n_evicted = srv_master_evict_from_table_cache(50);
+		MONITOR_INC_VALUE(
+			MONITOR_SRV_DICT_LRU_EVICT_COUNT_ACTIVE, n_evicted);
 		MONITOR_INC_TIME_IN_MICRO_SECS(
 			MONITOR_SRV_DICT_LRU_MICROSECOND, counter_time);
 	}
@@ -2970,6 +2979,7 @@ srv_master_do_idle_tasks(void)
 /*==========================*/
 {
 	ullint	counter_time;
+	ulint	n_evicted = 0;
 
 	++srv_main_idle_loops;
 
@@ -3007,7 +3017,9 @@ srv_master_do_idle_tasks(void)
 	}
 
 	srv_main_thread_op_info = "enforcing dict cache limit";
-	srv_master_evict_from_table_cache(100);
+	n_evicted = srv_master_evict_from_table_cache(100);
+        MONITOR_INC_VALUE(
+                MONITOR_SRV_DICT_LRU_EVICT_COUNT_IDLE, n_evicted);
 	MONITOR_INC_TIME_IN_MICRO_SECS(
 		MONITOR_SRV_DICT_LRU_MICROSECOND, counter_time);
 
@@ -3421,17 +3433,14 @@ srv_do_purge(
 		}
 
 		n_pages_purged = trx_purge(
-			n_use_threads, srv_purge_batch_size, false);
-
-		if (!(count++ % TRX_SYS_N_RSEGS)) {
-			/* Force a truncate of the history list. */
-			n_pages_purged += trx_purge(
-				1, srv_purge_batch_size, true);
-		}
+			n_use_threads, srv_purge_batch_size,
+			(++count % TRX_SYS_N_RSEGS) == 0);
 
 		*n_total_purged += n_pages_purged;
 
-	} while (!srv_purge_should_exit(n_pages_purged) && n_pages_purged > 0);
+	} while (!srv_purge_should_exit(n_pages_purged)
+		 && n_pages_purged > 0
+		 && purge_sys->state == PURGE_STATE_RUN);
 
 	return(rseg_history_len);
 }
@@ -3625,8 +3634,17 @@ DECLARE_THREAD(srv_purge_coordinator_thread)(
 		n_pages_purged = trx_purge(1, srv_purge_batch_size, false);
 	}
 
-	/* Force a truncate of the history list. */
-	n_pages_purged = trx_purge(1, srv_purge_batch_size, true);
+	/* This trx_purge is called to remove any undo records (added by
+	background threads) after completion of the above loop. When
+	srv_fast_shutdown != 0, a large batch size can cause significant
+	delay in shutdown ,so reducing the batch size to magic number 20
+	(which was default in 5.5), which we hope will be sufficient to
+	remove all the undo records */
+	const	uint temp_batch_size = 20;
+
+	n_pages_purged = trx_purge(1, srv_purge_batch_size <= temp_batch_size
+				      ? srv_purge_batch_size : temp_batch_size,
+				   true);
 	ut_a(n_pages_purged == 0 || srv_fast_shutdown != 0);
 
 	/* The task queue should always be empty, independent of fast

@@ -210,8 +210,6 @@ enum enum_server_command
 #define CLIENT_PS_MULTI_RESULTS (1UL << 18) /* Multi-results in PS-protocol */
 
 #define CLIENT_PLUGIN_AUTH  (1UL << 19) /* Client supports plugin authentication */
-
-#define CLIENT_PLUGIN_AUTH  (1UL << 19) /* Client supports plugin authentication */
 #define CLIENT_CONNECT_ATTRS (1UL << 20) /* Client supports connection attributes */
 /* Enable authentication response packet to be larger than 255 bytes. */
 #define CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA (1UL << 21)
@@ -386,10 +384,7 @@ typedef struct st_net {
     queries in cache that have not stored its results yet
   */
 #endif
-  /*
-    Unused, please remove with the next incompatible ABI change.
-  */
-  unsigned char *unused;
+  void *thd; 	   /* Used by MariaDB server to avoid calling current_thd */
   unsigned int last_errno;
   unsigned char error; 
   my_bool unused4; /* Please remove with the next incompatible ABI change. */
@@ -517,7 +512,7 @@ enum enum_mysql_set_option
 extern "C" {
 #endif
 
-my_bool	my_net_init(NET *net, Vio* vio, unsigned int my_flags);
+my_bool	my_net_init(NET *net, Vio* vio, void *thd, unsigned int my_flags);
 void	my_net_local_init(NET *net);
 void	net_end(NET *net);
 void	net_clear(NET *net, my_bool clear_buffer);
@@ -550,7 +545,7 @@ struct my_rnd_struct;
 enum Item_result
 {
   STRING_RESULT=0, REAL_RESULT, INT_RESULT, ROW_RESULT, DECIMAL_RESULT,
-  TIME_RESULT,IMPOSSIBLE_RESULT
+  TIME_RESULT
 };
 
 typedef struct st_udf_args

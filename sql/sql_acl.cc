@@ -874,6 +874,17 @@ static void free_acl_role(ACL_ROLE *role)
   delete_dynamic(&(role->parent_grantee));
 }
 
+static my_bool check_if_exists(THD *, plugin_ref, void *)
+{
+  return TRUE;
+}
+
+static bool has_validation_plugins()
+{
+  return plugin_foreach(NULL, check_if_exists,
+                        MariaDB_PASSWORD_VALIDATION_PLUGIN, NULL);
+}
+
 struct validation_data { LEX_STRING *user, *password; };
 
 static my_bool do_validate(THD *, plugin_ref plugin, void *arg)
@@ -885,22 +896,27 @@ static my_bool do_validate(THD *, plugin_ref plugin, void *arg)
 }
 
 
-static bool validate_password(LEX_STRING *user, LEX_STRING *password)
+static bool validate_password(LEX_USER *user)
 {
-  struct validation_data data= { user, password };
-  return plugin_foreach(NULL, do_validate,
-                        MariaDB_PASSWORD_VALIDATION_PLUGIN, &data);
-}
-
-static my_bool check_if_exists(THD *, plugin_ref, void *)
-{
-  return TRUE;
-}
-
-static bool has_validation_plugins()
-{
-  return plugin_foreach(NULL, check_if_exists,
-                        MariaDB_PASSWORD_VALIDATION_PLUGIN, NULL);
+  if (user->pwtext.length || !user->pwhash.length)
+  {
+    struct validation_data data= { &user->user, &user->pwtext };
+    if (plugin_foreach(NULL, do_validate,
+                       MariaDB_PASSWORD_VALIDATION_PLUGIN, &data))
+    {
+      my_error(ER_NOT_VALID_PASSWORD, MYF(0));
+      return true;
+    }
+  }
+  else
+  {
+    if (strict_password_validation && has_validation_plugins())
+    {
+      my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--strict-password-validation");
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -984,22 +1000,26 @@ static bool fix_user_plugin_ptr(ACL_USER *user)
 
   - if user->plugin is specified, user->auth is the plugin auth data.
   - if user->plugin is mysql_native_password or mysql_old_password,
-    user->auth if the password hash, and LEX_USER is transformed
+    user->auth is the password hash, and LEX_USER is transformed
     to match the next case (that is, user->plugin is cleared).
   - if user->plugin is NOT specified, built-in auth is assumed, that is
     mysql_native_password or mysql_old_password. In that case,
-    user->auth is the password hash. And user->password is the original
-    plain-text password. Either one can be set or even both.
+    user->pwhash is the password hash. And user->pwtext is the original
+    plain-text password. Either one can be set or both.
 
   Upon exiting this function:
 
-  - user->password is the password hash, as the mysql.user.password column
+  - user->pwtext is left untouched
+  - user->pwhash is the password hash, as the mysql.user.password column
   - user->plugin is the plugin name, as the mysql.user.plugin column
   - user->auth is the plugin auth data, as the mysql.user.authentication_string column
 */
 static bool fix_lex_user(THD *thd, LEX_USER *user)
 {
   size_t check_length;
+
+  DBUG_ASSERT(user->plugin.length || !user->auth.length);
+  DBUG_ASSERT(!(user->plugin.length && (user->pwtext.length || user->pwhash.length)));
 
   if (my_strcasecmp(system_charset_info, user->plugin.str,
                     native_password_plugin_name.str) == 0)
@@ -1011,36 +1031,26 @@ static bool fix_lex_user(THD *thd, LEX_USER *user)
   else
   if (user->plugin.length)
     return false; // nothing else to do
-  else
-  if (user->auth.length == SCRAMBLED_PASSWORD_CHAR_LENGTH_323)
-    check_length= 0; // length is valid, no need to re-check
+  else if (thd->variables.old_passwords == 1 ||
+           user->pwhash.length == SCRAMBLED_PASSWORD_CHAR_LENGTH_323)
+    check_length= SCRAMBLED_PASSWORD_CHAR_LENGTH_323;
   else
     check_length= SCRAMBLED_PASSWORD_CHAR_LENGTH;
 
-  if (check_length && user->auth.length && user->auth.length != check_length)
+  if (user->plugin.length)
+  {
+    user->pwhash= user->auth;
+    user->plugin= empty_lex_str;
+    user->auth= empty_lex_str;
+  }
+
+  if (user->pwhash.length && user->pwhash.length != check_length)
   {
     my_error(ER_PASSWD_LENGTH, MYF(0), check_length);
     return true;
   }
 
-  if (user->password.length || !user->auth.length)
-  {
-    if (validate_password(&user->user, &user->password))
-    {
-      my_error(ER_NOT_VALID_PASSWORD, MYF(0));
-      return true;
-    }
-  }
-  else
-  {
-    if (strict_password_validation && has_validation_plugins())
-    {
-      my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--strict-password-validation");
-      return true;
-    }
-  }
-
-  if (user->password.length && !user->auth.length)
+  if (user->pwtext.length && !user->pwhash.length)
   {
     size_t scramble_length;
     void (*make_scramble)(char *, const char *, size_t);
@@ -1059,14 +1069,11 @@ static bool fix_lex_user(THD *thd, LEX_USER *user)
     char *buff= (char *) thd->alloc(scramble_length + 1);
     if (buff == NULL)
       return true;
-    make_scramble(buff, user->password.str, user->password.length);
-    user->auth.str= buff;
-    user->auth.length= scramble_length;
+    make_scramble(buff, user->pwtext.str, user->pwtext.length);
+    user->pwhash.str= buff;
+    user->pwhash.length= scramble_length;
   }
 
-  user->password= user->auth.length ? user->auth : null_lex_str;
-  user->plugin= empty_lex_str;
-  user->auth= empty_lex_str;
   return false;
 }
 
@@ -1219,7 +1226,7 @@ static bool acl_load(THD *thd, TABLE_LIST *tables)
         char *end = strnmov(tmp_name, host.db, sizeof(tmp_name));
         if (end >= tmp_name + sizeof(tmp_name))
         {
-          sql_print_warning(ER(ER_WRONG_DB_NAME), host.db);
+          sql_print_warning(ER_THD(thd, ER_WRONG_DB_NAME), host.db);
           continue;
         }
         my_casedn_str(files_charset_info, host.db);
@@ -1556,7 +1563,7 @@ static bool acl_load(THD *thd, TABLE_LIST *tables)
       char *end = strnmov(tmp_name, db.db, sizeof(tmp_name));
       if (end >= tmp_name + sizeof(tmp_name))
       {
-        sql_print_warning(ER(ER_WRONG_DB_NAME), db.db);
+        sql_print_warning(ER_THD(thd, ER_WRONG_DB_NAME), db.db);
         continue;
       }
       my_casedn_str(files_charset_info, db.db);
@@ -2693,9 +2700,11 @@ static int check_alter_user(THD *thd, const char *host, const char *user)
   }
 
   if (IF_WSREP((!WSREP(thd) || !thd->wsrep_applier), 1) &&
-      !thd->slave_thread && !thd->security_ctx->priv_user[0])
+      !thd->slave_thread && !thd->security_ctx->priv_user[0] &&
+      !in_bootstrap)
   {
-    my_message(ER_PASSWORD_ANONYMOUS_USER, ER(ER_PASSWORD_ANONYMOUS_USER),
+    my_message(ER_PASSWORD_ANONYMOUS_USER,
+               ER_THD(thd, ER_PASSWORD_ANONYMOUS_USER),
                MYF(0));
     goto end;
   }
@@ -2735,7 +2744,8 @@ bool check_change_password(THD *thd, LEX_USER *user)
 {
   LEX_USER *real_user= get_current_user(thd, user);
 
-  if (fix_and_copy_user(real_user, user, thd))
+  if (fix_and_copy_user(real_user, user, thd) ||
+      validate_password(real_user))
     return true;
 
   *user= *real_user;
@@ -2765,7 +2775,7 @@ bool change_password(THD *thd, LEX_USER *user)
   const CSET_STRING query_save __attribute__((unused)) = thd->query_string;
   DBUG_ENTER("change_password");
   DBUG_PRINT("enter",("host: '%s'  user: '%s'  new_password: '%s'",
-		      user->host.str, user->user.str, user->password.str));
+		      user->host.str, user->user.str, user->pwhash.str));
   DBUG_ASSERT(user->host.str != 0);                     // Ensured by parent
 
   /*
@@ -2782,7 +2792,7 @@ bool change_password(THD *thd, LEX_USER *user)
   {
     query_length= sprintf(buff, "SET PASSWORD FOR '%-.120s'@'%-.120s'='%-.120s'",
               safe_str(user->user.str), safe_str(user->host.str),
-              safe_str(user->password.str));
+              safe_str(user->pwhash.str));
   }
 
   if (WSREP(thd) && !IF_WSREP(thd->wsrep_applier, 0))
@@ -2801,7 +2811,8 @@ bool change_password(THD *thd, LEX_USER *user)
   if (!(acl_user= find_user_exact(user->host.str, user->user.str)))
   {
     mysql_mutex_unlock(&acl_cache->lock);
-    my_message(ER_PASSWORD_NO_MATCH, ER(ER_PASSWORD_NO_MATCH), MYF(0));
+    my_message(ER_PASSWORD_NO_MATCH,
+               ER_THD(thd, ER_PASSWORD_NO_MATCH), MYF(0));
     goto end;
   }
 
@@ -2809,19 +2820,20 @@ bool change_password(THD *thd, LEX_USER *user)
   if (acl_user->plugin.str == native_password_plugin_name.str ||
       acl_user->plugin.str == old_password_plugin_name.str)
   {
-    acl_user->auth_string.str= strmake_root(&acl_memroot, user->password.str, user->password.length);
-    acl_user->auth_string.length= user->password.length;
-    set_user_salt(acl_user, user->password.str, user->password.length);
-    set_user_plugin(acl_user, user->password.length);
+    acl_user->auth_string.str= strmake_root(&acl_memroot, user->pwhash.str, user->pwhash.length);
+    acl_user->auth_string.length= user->pwhash.length;
+    set_user_salt(acl_user, user->pwhash.str, user->pwhash.length);
+    set_user_plugin(acl_user, user->pwhash.length);
   }
   else
     push_warning(thd, Sql_condition::WARN_LEVEL_NOTE,
-                 ER_SET_PASSWORD_AUTH_PLUGIN, ER(ER_SET_PASSWORD_AUTH_PLUGIN));
+                 ER_SET_PASSWORD_AUTH_PLUGIN,
+                 ER_THD(thd, ER_SET_PASSWORD_AUTH_PLUGIN));
 
   if (update_user_table(thd, tables[USER_TABLE].table,
                         safe_str(acl_user->host.hostname),
                         safe_str(acl_user->user.str),
-			user->password.str, user->password.length))
+                        user->pwhash.str, user->pwhash.length))
   {
     mysql_mutex_unlock(&acl_cache->lock); /* purecov: deadcode */
     goto end;
@@ -2925,7 +2937,8 @@ int acl_set_default_role(THD *thd, const char *host, const char *user,
   if (!(acl_user= find_user_exact(host, user)))
   {
     mysql_mutex_unlock(&acl_cache->lock);
-    my_message(ER_PASSWORD_NO_MATCH, ER(ER_PASSWORD_NO_MATCH), MYF(0));
+    my_message(ER_PASSWORD_NO_MATCH, ER_THD(thd, ER_PASSWORD_NO_MATCH),
+               MYF(0));
     goto end;
   }
 
@@ -2961,7 +2974,8 @@ int acl_set_default_role(THD *thd, const char *host, const char *user,
                                          HA_READ_KEY_EXACT))
   {
     mysql_mutex_unlock(&acl_cache->lock);
-    my_message(ER_PASSWORD_NO_MATCH, ER(ER_PASSWORD_NO_MATCH), MYF(0));
+    my_message(ER_PASSWORD_NO_MATCH, ER_THD(thd, ER_PASSWORD_NO_MATCH),
+               MYF(0));
     goto end;
   }
   store_record(table, record[1]);
@@ -3291,7 +3305,7 @@ static bool update_user_table(THD *thd, TABLE *table,
                                          (uchar *) user_key, HA_WHOLE_KEY,
                                          HA_READ_KEY_EXACT))
   {
-    my_message(ER_PASSWORD_NO_MATCH, ER(ER_PASSWORD_NO_MATCH),
+    my_message(ER_PASSWORD_NO_MATCH, ER_THD(thd, ER_PASSWORD_NO_MATCH),
                MYF(0));	/* purecov: deadcode */
     DBUG_RETURN(1);				/* purecov: deadcode */
   }
@@ -3360,17 +3374,18 @@ static int replace_user_table(THD *thd, TABLE *table, LEX_USER &combo,
 
   mysql_mutex_assert_owner(&acl_cache->lock);
 
-  if (combo.password.str && combo.password.str[0])
+  if (combo.pwhash.str && combo.pwhash.str[0])
   {
-    if (combo.password.length != SCRAMBLED_PASSWORD_CHAR_LENGTH &&
-        combo.password.length != SCRAMBLED_PASSWORD_CHAR_LENGTH_323)
+    if (combo.pwhash.length != SCRAMBLED_PASSWORD_CHAR_LENGTH &&
+        combo.pwhash.length != SCRAMBLED_PASSWORD_CHAR_LENGTH_323)
     {
+      DBUG_ASSERT(0);
       my_error(ER_PASSWD_LENGTH, MYF(0), SCRAMBLED_PASSWORD_CHAR_LENGTH);
       DBUG_RETURN(-1);
     }
   }
   else
-    combo.password= empty_lex_str;
+    combo.pwhash= empty_lex_str;
 
   /* if the user table is not up to date, we can't handle role updates */
   if (table->s->fields <= ROLE_ASSIGN_COLUMN_IDX && handle_as_role)
@@ -3412,7 +3427,7 @@ static int replace_user_table(THD *thd, TABLE *table, LEX_USER &combo,
 
       see also test_if_create_new_users()
     */
-    else if (!combo.password.length && !combo.plugin.length && no_auto_create)
+    else if (!combo.pwhash.length && !combo.plugin.length && no_auto_create)
     {
       my_error(ER_PASSWORD_NO_MATCH, MYF(0));
       goto end;
@@ -3444,6 +3459,10 @@ static int replace_user_table(THD *thd, TABLE *table, LEX_USER &combo,
     store_record(table,record[1]);			// Save copy for update
   }
 
+  if (!old_row_exists || combo.pwtext.length || combo.pwhash.length)
+    if (validate_password(&combo))
+      goto end;
+
   /* Update table columns with new privileges */
 
   Field **tmp_field;
@@ -3459,8 +3478,8 @@ static int replace_user_table(THD *thd, TABLE *table, LEX_USER &combo,
   }
   rights= get_access(table, 3, &next_field);
   DBUG_PRINT("info",("table fields: %d",table->s->fields));
-  if (combo.password.str[0])
-    table->field[2]->store(combo.password.str, combo.password.length, system_charset_info);
+  if (combo.pwhash.str[0])
+    table->field[2]->store(combo.pwhash.str, combo.pwhash.length, system_charset_info);
   if (table->s->fields >= 31)		/* From 4.0.0 we have more fields */
   {
     /* We write down SSL related ACL stuff */
@@ -3523,14 +3542,14 @@ static int replace_user_table(THD *thd, TABLE *table, LEX_USER &combo,
       table->field[next_field + 1]->set_notnull();
       if (combo.plugin.str[0])
       {
-        DBUG_ASSERT(combo.password.str[0] == 0);
+        DBUG_ASSERT(combo.pwhash.str[0] == 0);
         table->field[2]->reset();
         table->field[next_field]->store(combo.plugin.str, combo.plugin.length,
                                         system_charset_info);
         table->field[next_field + 1]->store(combo.auth.str, combo.auth.length,
                                             system_charset_info);
       }
-      if (combo.password.str[0])
+      if (combo.pwhash.str[0])
       {
         DBUG_ASSERT(combo.plugin.str[0] == 0);
         table->field[next_field]->reset();
@@ -3599,7 +3618,7 @@ end:
         acl_update_role(combo.user.str, rights);
       else
         acl_update_user(combo.user.str, combo.host.str,
-                        combo.password.str, combo.password.length,
+                        combo.pwhash.str, combo.pwhash.length,
                         lex->ssl_type,
                         lex->ssl_cipher,
                         lex->x509_issuer,
@@ -3615,7 +3634,7 @@ end:
         acl_insert_role(combo.user.str, rights);
       else
         acl_insert_user(combo.user.str, combo.host.str,
-                        combo.password.str, combo.password.length,
+                        combo.pwhash.str, combo.pwhash.length,
                         lex->ssl_type,
                         lex->ssl_cipher,
                         lex->x509_issuer,
@@ -3652,7 +3671,8 @@ static int replace_db_table(TABLE *table, const char *db,
     /* The user could be a role, check if the user is registered as a role */
     if (!combo.host.length && !find_acl_role(combo.user.str))
     {
-      my_message(ER_PASSWORD_NO_MATCH, ER(ER_PASSWORD_NO_MATCH), MYF(0));
+      my_message(ER_PASSWORD_NO_MATCH, ER_THD(table->in_use,
+                                              ER_PASSWORD_NO_MATCH), MYF(0));
       DBUG_RETURN(-1);
     }
   }
@@ -3919,7 +3939,8 @@ replace_proxies_priv_table(THD *thd, TABLE *table, const LEX_USER *user,
   /* Check if there is such a user in user table in memory? */
   if (!find_user_wild(user->host.str,user->user.str))
   {
-    my_message(ER_PASSWORD_NO_MATCH, ER(ER_PASSWORD_NO_MATCH), MYF(0));
+    my_message(ER_PASSWORD_NO_MATCH,
+               ER_THD(thd, ER_PASSWORD_NO_MATCH), MYF(0));
     DBUG_RETURN(-1);
   }
 
@@ -4584,7 +4605,7 @@ static int replace_table_table(THD *thd, GRANT_TABLE *grant_table,
   {
     if (!combo.host.length && !find_acl_role(combo.user.str))
     {
-      my_message(ER_PASSWORD_NO_MATCH, ER(ER_PASSWORD_NO_MATCH),
+      my_message(ER_PASSWORD_NO_MATCH, ER_THD(thd, ER_PASSWORD_NO_MATCH),
                  MYF(0)); /* purecov: deadcode */
       DBUG_RETURN(-1);                            /* purecov: deadcode */
     }
@@ -5671,7 +5692,7 @@ static bool merge_one_role_privileges(ACL_ROLE *grantee)
 
 static bool has_auth(LEX_USER *user, LEX *lex)
 {
-  return user->password.str || user->plugin.length || user->auth.length ||
+  return user->pwtext.length || user->pwhash.length || user->plugin.length || user->auth.length ||
          lex->ssl_type != SSL_TYPE_NOT_SPECIFIED || lex->ssl_cipher ||
          lex->x509_issuer || lex->x509_subject ||
          lex->mqh.specified_limits;
@@ -5682,7 +5703,8 @@ static bool fix_and_copy_user(LEX_USER *to, LEX_USER *from, THD *thd)
   if (to != from)
   {
     /* preserve authentication information, if LEX_USER was  reallocated */
-    to->password= from->password;
+    to->pwtext= from->pwtext;
+    to->pwhash= from->pwhash;
     to->plugin= from->plugin;
     to->auth= from->auth;
   }
@@ -5744,7 +5766,8 @@ int mysql_table_grant(THD *thd, TABLE_LIST *table_list,
 
   if (rights & ~TABLE_ACLS)
   {
-    my_message(ER_ILLEGAL_GRANT_FOR_TABLE, ER(ER_ILLEGAL_GRANT_FOR_TABLE),
+    my_message(ER_ILLEGAL_GRANT_FOR_TABLE,
+               ER_THD(thd, ER_ILLEGAL_GRANT_FOR_TABLE),
                MYF(0));
     DBUG_RETURN(TRUE);
   }
@@ -5989,7 +6012,8 @@ bool mysql_routine_grant(THD *thd, TABLE_LIST *table_list, bool is_proc,
 
   if (rights & ~PROC_ACLS)
   {
-    my_message(ER_ILLEGAL_GRANT_FOR_TABLE, ER(ER_ILLEGAL_GRANT_FOR_TABLE),
+    my_message(ER_ILLEGAL_GRANT_FOR_TABLE,
+               ER_THD(thd, ER_ILLEGAL_GRANT_FOR_TABLE),
                MYF(0));
     DBUG_RETURN(TRUE);
   }
@@ -6885,16 +6909,18 @@ bool check_grant(THD *thd, ulong want_access, TABLE_LIST *tables,
 
   for (tl= tables; number-- ; tl= tl->next_global)
   {
-    sctx= MY_TEST(tl->security_ctx) ? tl->security_ctx : thd->security_ctx;
+    TABLE_LIST *const t_ref=
+      tl->correspondent_table ? tl->correspondent_table : tl;
+    sctx= t_ref->security_ctx ? t_ref->security_ctx : thd->security_ctx;
 
     const ACL_internal_table_access *access=
-      get_cached_table_access(&tl->grant.m_internal,
-                              tl->get_db_name(),
-                              tl->get_table_name());
+      get_cached_table_access(&t_ref->grant.m_internal,
+                              t_ref->get_db_name(),
+                              t_ref->get_table_name());
 
     if (access)
     {
-      switch(access->check(orig_want_access, &tl->grant.privilege))
+      switch(access->check(orig_want_access, &t_ref->grant.privilege))
       {
       case ACL_INTERNAL_ACCESS_GRANTED:
         /*
@@ -6918,26 +6944,26 @@ bool check_grant(THD *thd, ulong want_access, TABLE_LIST *tables,
     if (!want_access)
       continue;                                 // ok
 
-    if (!(~tl->grant.privilege & want_access) ||
-        tl->is_anonymous_derived_table() || tl->schema_table)
+    if (!(~t_ref->grant.privilege & want_access) ||
+        t_ref->is_anonymous_derived_table() || t_ref->schema_table)
     {
       /*
-        It is subquery in the FROM clause. VIEW set tl->derived after
+        It is subquery in the FROM clause. VIEW set t_ref->derived after
         table opening, but this function always called before table opening.
       */
-      if (!tl->referencing_view)
+      if (!t_ref->referencing_view)
       {
         /*
           If it's a temporary table created for a subquery in the FROM
           clause, or an INFORMATION_SCHEMA table, drop the request for
           a privilege.
         */
-        tl->grant.want_privilege= 0;
+        t_ref->grant.want_privilege= 0;
       }
       continue;
     }
 
-    if (is_temporary_table(tl))
+    if (is_temporary_table(t_ref))
     {
       /*
         If this table list element corresponds to a pre-opened temporary
@@ -6945,8 +6971,8 @@ bool check_grant(THD *thd, ulong want_access, TABLE_LIST *tables,
         Note that during creation of temporary table we still need to check
         if user has CREATE_TMP_ACL.
       */
-      tl->grant.privilege|= TMP_TABLE_ACLS;
-      tl->grant.want_privilege= 0;
+      t_ref->grant.privilege|= TMP_TABLE_ACLS;
+      t_ref->grant.want_privilege= 0;
       continue;
     }
 
@@ -6957,20 +6983,20 @@ bool check_grant(THD *thd, ulong want_access, TABLE_LIST *tables,
     }
 
     grant_table= table_hash_search(sctx->host, sctx->ip,
-                                   tl->get_db_name(),
+                                   t_ref->get_db_name(),
                                    sctx->priv_user,
-                                   tl->get_table_name(),
+                                   t_ref->get_table_name(),
                                    FALSE);
     if (sctx->priv_role[0])
-      grant_table_role= table_hash_search("", NULL, tl->get_db_name(),
+      grant_table_role= table_hash_search("", NULL, t_ref->get_db_name(),
                                           sctx->priv_role,
-                                          tl->get_table_name(),
+                                          t_ref->get_table_name(),
                                           TRUE);
 
     if (!grant_table && !grant_table_role)
     {
-      want_access&= ~tl->grant.privilege;
-      goto err;
+      want_access&= ~t_ref->grant.privilege;
+      goto err;					// No grants
     }
 
     /*
@@ -6980,19 +7006,19 @@ bool check_grant(THD *thd, ulong want_access, TABLE_LIST *tables,
     if (any_combination_will_do)
       continue;
 
-    tl->grant.grant_table_user= grant_table; // Remember for column test
-    tl->grant.grant_table_role= grant_table_role;
-    tl->grant.version= grant_version;
-    tl->grant.privilege|= grant_table ? grant_table->privs : 0;
-    tl->grant.privilege|= grant_table_role ? grant_table_role->privs : 0;
-    tl->grant.want_privilege= ((want_access & COL_ACLS) & ~tl->grant.privilege);
+    t_ref->grant.grant_table_user= grant_table; // Remember for column test
+    t_ref->grant.grant_table_role= grant_table_role;
+    t_ref->grant.version= grant_version;
+    t_ref->grant.privilege|= grant_table ? grant_table->privs : 0;
+    t_ref->grant.privilege|= grant_table_role ? grant_table_role->privs : 0;
+    t_ref->grant.want_privilege= ((want_access & COL_ACLS) & ~t_ref->grant.privilege);
 
-    if (!(~tl->grant.privilege & want_access))
+    if (!(~t_ref->grant.privilege & want_access))
       continue;
 
     if ((want_access&= ~((grant_table ? grant_table->cols : 0) |
                         (grant_table_role ? grant_table_role->cols : 0) |
-                        tl->grant.privilege)))
+                        t_ref->grant.privilege)))
     {
       goto err;                                 // impossible
     }
@@ -7160,7 +7186,7 @@ bool check_column_grant_in_table_ref(THD *thd, TABLE_LIST * table_ref,
         return FALSE;
       }
       table_ref->belong_to_view->allowed_show= FALSE;
-      my_message(ER_VIEW_NO_EXPLAIN, ER(ER_VIEW_NO_EXPLAIN), MYF(0));
+      my_message(ER_VIEW_NO_EXPLAIN, ER_THD(thd, ER_VIEW_NO_EXPLAIN), MYF(0));
       return TRUE;
     }
   }
@@ -7714,6 +7740,16 @@ static int show_grants_callback(ACL_USER_BASE *role, void *data)
 }
 
 
+void mysql_show_grants_get_fields(THD *thd, List<Item> *fields,
+                                  const char *name)
+{
+  Item_string *field=new (thd->mem_root) Item_string_ascii(thd, "", 0);
+  field->name= (char *) name;
+  field->max_length=1024;
+  fields->push_back(field, thd->mem_root);
+}
+
+
 /*
   SHOW GRANTS;  Send grants for a user to the client
 
@@ -7779,17 +7815,17 @@ bool mysql_show_grants(THD *thd, LEX_USER *lex_user)
   }
   DBUG_ASSERT(rolename || username);
 
-  Item_string *field=new Item_string_ascii("", 0);
   List<Item> field_list;
-  field->name=buff;
-  field->max_length=1024;
   if (!username)
     strxmov(buff,"Grants for ",rolename, NullS);
   else
     strxmov(buff,"Grants for ",username,"@",hostname, NullS);
-  field_list.push_back(field);
+
+  mysql_show_grants_get_fields(thd, &field_list, buff);
+
   if (protocol->send_result_set_metadata(&field_list,
-                                         Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF))
+                                         Protocol::SEND_NUM_ROWS |
+                                         Protocol::SEND_EOF))
   {
     mysql_mutex_unlock(&acl_cache->lock);
     mysql_rwlock_unlock(&LOCK_grant);
@@ -8565,7 +8601,7 @@ static int handle_roles_mappings_table(TABLE *table, bool drop,
 
   int error;
   int result= 0;
-  THD *thd= current_thd;
+  THD *thd= table->in_use;
   const char *host, *user, *role;
   Field *host_field= table->field[0];
   Field *user_field= table->field[1];
@@ -8658,7 +8694,7 @@ static int handle_roles_mappings_table(TABLE *table, bool drop,
     < 0         Error.
 */
 
-static int handle_grant_table(TABLE_LIST *tables,
+static int handle_grant_table(THD *thd, TABLE_LIST *tables,
                               enum enum_acl_tables table_no, bool drop,
                               LEX_USER *user_from, LEX_USER *user_to)
 {
@@ -8675,7 +8711,6 @@ static int handle_grant_table(TABLE_LIST *tables,
   uchar user_key[MAX_KEY_LENGTH];
   uint key_prefix_length;
   DBUG_ENTER("handle_grant_table");
-  THD *thd= current_thd;
 
   if (table_no == ROLES_MAPPING_TABLE)
   {
@@ -8975,10 +9010,30 @@ static int handle_grant_struct(enum enum_acl_lists struct_no, bool drop,
     if (struct_no == ROLES_MAPPINGS_HASH)
     {
       const char* role= role_grant_pair->r_uname? role_grant_pair->r_uname: "";
-      if (user_from->is_role() ? strcmp(user_from->user.str, role) :
-          (strcmp(user_from->user.str, user) ||
-           my_strcasecmp(system_charset_info, user_from->host.str, host)))
-        continue;
+      if (user_from->is_role())
+      {
+        /* When searching for roles within the ROLES_MAPPINGS_HASH, we have
+           to check both the user field as well as the role field for a match.
+
+           It is possible to have a role granted to a role. If we are going
+           to modify the mapping entry, it needs to be done on either on the
+           "user" end (here represented by a role) or the "role" end. At least
+           one part must match.
+
+           If the "user" end has a not-empty host string, it can never match
+           as we are searching for a role here. A role always has an empty host
+           string.
+        */
+        if ((*host || strcmp(user_from->user.str, user)) &&
+            strcmp(user_from->user.str, role))
+          continue;
+      }
+      else
+      {
+        if (strcmp(user_from->user.str, user) ||
+            my_strcasecmp(system_charset_info, user_from->host.str, host))
+          continue;
+      }
     }
     else
     {
@@ -9079,8 +9134,7 @@ static int handle_grant_struct(enum enum_acl_lists struct_no, bool drop,
             So we need to examine the current element once again, but
             we don't need to restart the search from the beginning.
           */
-          if (idx != elements)
-            idx++;
+          idx++;
           break;
         }
 
@@ -9112,6 +9166,7 @@ static int handle_grant_struct(enum enum_acl_lists struct_no, bool drop,
 
           my_hash_update(roles_mappings_hash, (uchar*) role_grant_pair,
                          (uchar*) old_key, old_key_length);
+          idx++; // see the comment above
           break;
         }
 
@@ -9159,7 +9214,7 @@ static int handle_grant_struct(enum enum_acl_lists struct_no, bool drop,
     < 0         Error.
 */
 
-static int handle_grant_data(TABLE_LIST *tables, bool drop,
+static int handle_grant_data(THD *thd, TABLE_LIST *tables, bool drop,
                              LEX_USER *user_from, LEX_USER *user_to)
 {
   int result= 0;
@@ -9182,7 +9237,8 @@ static int handle_grant_data(TABLE_LIST *tables, bool drop,
   }
 
   /* Handle db table. */
-  if ((found= handle_grant_table(tables, DB_TABLE, drop, user_from, user_to)) < 0)
+  if ((found= handle_grant_table(thd, tables, DB_TABLE, drop, user_from,
+                                 user_to)) < 0)
   {
     /* Handle of table failed, don't touch the in-memory array. */
     result= -1;
@@ -9202,7 +9258,8 @@ static int handle_grant_data(TABLE_LIST *tables, bool drop,
   }
 
   /* Handle stored routines table. */
-  if ((found= handle_grant_table(tables, PROCS_PRIV_TABLE, drop, user_from, user_to)) < 0)
+  if ((found= handle_grant_table(thd, tables, PROCS_PRIV_TABLE, drop,
+                                 user_from, user_to)) < 0)
   {
     /* Handle of table failed, don't touch in-memory array. */
     result= -1;
@@ -9230,7 +9287,8 @@ static int handle_grant_data(TABLE_LIST *tables, bool drop,
   }
 
   /* Handle tables table. */
-  if ((found= handle_grant_table(tables, TABLES_PRIV_TABLE, drop, user_from, user_to)) < 0)
+  if ((found= handle_grant_table(thd, tables, TABLES_PRIV_TABLE, drop,
+                                 user_from, user_to)) < 0)
   {
     /* Handle of table failed, don't touch columns and in-memory array. */
     result= -1;
@@ -9246,7 +9304,8 @@ static int handle_grant_data(TABLE_LIST *tables, bool drop,
     }
 
     /* Handle columns table. */
-    if ((found= handle_grant_table(tables, COLUMNS_PRIV_TABLE, drop, user_from, user_to)) < 0)
+    if ((found= handle_grant_table(thd, tables, COLUMNS_PRIV_TABLE, drop,
+                                   user_from, user_to)) < 0)
     {
       /* Handle of table failed, don't touch the in-memory array. */
       result= -1;
@@ -9265,7 +9324,8 @@ static int handle_grant_data(TABLE_LIST *tables, bool drop,
   /* Handle proxies_priv table. */
   if (tables[PROXIES_PRIV_TABLE].table)
   {
-    if ((found= handle_grant_table(tables, PROXIES_PRIV_TABLE, drop, user_from, user_to)) < 0)
+    if ((found= handle_grant_table(thd, tables, PROXIES_PRIV_TABLE, drop,
+                                   user_from, user_to)) < 0)
     {
       /* Handle of table failed, don't touch the in-memory array. */
       result= -1;
@@ -9284,7 +9344,8 @@ static int handle_grant_data(TABLE_LIST *tables, bool drop,
   /* Handle roles_mapping table. */
   if (tables[ROLES_MAPPING_TABLE].table)
   {
-    if ((found= handle_grant_table(tables, ROLES_MAPPING_TABLE, drop, user_from, user_to)) < 0)
+    if ((found= handle_grant_table(thd, tables, ROLES_MAPPING_TABLE, drop,
+                                   user_from, user_to)) < 0)
     {
       /* Handle of table failed, don't touch the in-memory array. */
       result= -1;
@@ -9301,7 +9362,8 @@ static int handle_grant_data(TABLE_LIST *tables, bool drop,
   }
 
   /* Handle user table. */
-  if ((found= handle_grant_table(tables, USER_TABLE, drop, user_from, user_to)) < 0)
+  if ((found= handle_grant_table(thd, tables, USER_TABLE, drop, user_from,
+                                 user_to)) < 0)
   {
     /* Handle of table failed, don't touch the in-memory array. */
     result= -1;
@@ -9395,12 +9457,12 @@ bool mysql_create_user(THD *thd, List <LEX_USER> &list, bool handle_as_role)
       Search all in-memory structures and grant tables
       for a mention of the new user/role name.
     */
-    if (handle_grant_data(tables, 0, user_name, NULL))
+    if (handle_grant_data(thd, tables, 0, user_name, NULL))
     {
       if (thd->lex->create_info.or_replace())
       {
         // Drop the existing user
-        if (handle_grant_data(tables, 1, user_name, NULL) <= 0)
+        if (handle_grant_data(thd, tables, 1, user_name, NULL) <= 0)
         {
           // DROP failed
           append_user(thd, &wrong_users, user_name);
@@ -9414,11 +9476,13 @@ bool mysql_create_user(THD *thd, List <LEX_USER> &list, bool handle_as_role)
         binlog= true;
         if (handle_as_role)
           push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE,
-                              ER_ROLE_CREATE_EXISTS, ER(ER_ROLE_CREATE_EXISTS),
+                              ER_ROLE_CREATE_EXISTS,
+                              ER_THD(thd, ER_ROLE_CREATE_EXISTS),
                               user_name->user.str);
         else
           push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE,
-                              ER_USER_CREATE_EXISTS, ER(ER_USER_CREATE_EXISTS),
+                              ER_USER_CREATE_EXISTS,
+                              ER_THD(thd, ER_USER_CREATE_EXISTS),
                               user_name->user.str, user_name->host.str);
         continue;
       }
@@ -9541,7 +9605,7 @@ bool mysql_drop_user(THD *thd, List <LEX_USER> &list, bool handle_as_role)
       continue;
     }
 
-    if ((rc= handle_grant_data(tables, 1, user_name, NULL)) > 0)
+    if ((rc= handle_grant_data(thd, tables, 1, user_name, NULL)) > 0)
     {
       // The user or role was successfully deleted
       binlog= true;
@@ -9553,11 +9617,13 @@ bool mysql_drop_user(THD *thd, List <LEX_USER> &list, bool handle_as_role)
       // "DROP USER IF EXISTS user1" for a non-existing user or role
       if (handle_as_role)
         push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE,
-                            ER_ROLE_DROP_EXISTS, ER(ER_ROLE_DROP_EXISTS),
+                            ER_ROLE_DROP_EXISTS,
+                            ER_THD(thd, ER_ROLE_DROP_EXISTS),
                             user_name->user.str);
       else
         push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE,
-                            ER_USER_DROP_EXISTS, ER(ER_USER_DROP_EXISTS),
+                            ER_USER_DROP_EXISTS,
+                            ER_THD(thd, ER_USER_DROP_EXISTS),
                             user_name->user.str, user_name->host.str);
       binlog= true;
       continue;
@@ -9652,8 +9718,8 @@ bool mysql_rename_user(THD *thd, List <LEX_USER> &list)
       Search all in-memory structures and grant tables
       for a mention of the new user name.
     */
-    if (handle_grant_data(tables, 0, user_to, NULL) ||
-        handle_grant_data(tables, 0, user_from, user_to) <= 0)
+    if (handle_grant_data(thd, tables, 0, user_to, NULL) ||
+        handle_grant_data(thd, tables, 0, user_from, user_to) <= 0)
     {
       /* NOTE TODO renaming roles is not yet implemented */
       append_user(thd, &wrong_users, user_from);
@@ -9908,8 +9974,8 @@ bool mysql_revoke_all(THD *thd,  List <LEX_USER> &list)
   mysql_mutex_unlock(&acl_cache->lock);
 
   if (result)
-    my_message(ER_REVOKE_GRANTS, ER(ER_REVOKE_GRANTS), MYF(0));
-
+    my_message(ER_REVOKE_GRANTS, ER_THD(thd, ER_REVOKE_GRANTS), MYF(0));
+  
   result= result |
     write_bin_log(thd, FALSE, thd->query(), thd->query_length());
 
@@ -10067,7 +10133,7 @@ bool sp_revoke_privileges(THD *thd, const char *sp_db, const char *sp_name,
 
   @return
     @retval FALSE Success
-    @retval TRUE An error occured. Error message not yet sent.
+    @retval TRUE An error occurred. Error message not yet sent.
 */
 
 bool sp_grant_privileges(THD *thd, const char *sp_db, const char *sp_name,
@@ -10113,19 +10179,15 @@ bool sp_grant_privileges(THD *thd, const char *sp_db, const char *sp_name,
   thd->make_lex_string(&combo->user, combo->user.str, strlen(combo->user.str));
   thd->make_lex_string(&combo->host, combo->host.str, strlen(combo->host.str));
 
-  combo->password= null_lex_str;
-  combo->plugin= empty_lex_str;
-  combo->auth= empty_lex_str;
+  combo->reset_auth();
 
   if(au)
   {
-    if (au->plugin.str != native_password_plugin_name.str &&
-        au->plugin.str != old_password_plugin_name.str)
-      combo->plugin= au->plugin;
+    combo->plugin= au->plugin;
     combo->auth= au->auth_string;
   }
 
-  if (user_list.push_back(combo))
+  if (user_list.push_back(combo, thd->mem_root))
     DBUG_RETURN(TRUE);
 
   thd->lex->ssl_type= SSL_TYPE_NOT_SPECIFIED;
@@ -10227,6 +10289,8 @@ acl_check_proxy_grant_access(THD *thd, const char *host, const char *user,
     DBUG_RETURN(FALSE);
   }
 
+  mysql_mutex_lock(&acl_cache->lock);
+
   /* check for matching WITH PROXY rights */
   for (uint i=0; i < acl_proxy_users.elements; i++)
   {
@@ -10239,10 +10303,12 @@ acl_check_proxy_grant_access(THD *thd, const char *host, const char *user,
         proxy->get_with_grant())
     {
       DBUG_PRINT("info", ("found"));
+      mysql_mutex_unlock(&acl_cache->lock);
       DBUG_RETURN(FALSE);
     }
   }
 
+  mysql_mutex_unlock(&acl_cache->lock);
   my_error(ER_ACCESS_DENIED_NO_PASSWORD_ERROR, MYF(0),
            thd->security_ctx->user,
            thd->security_ctx->host_or_ip);
@@ -10363,11 +10429,14 @@ static int show_column_grants(THD *thd, SHOW_VAR *var, char *buff,
   var->type= SHOW_ULONG;
   var->value= buff;
   *(ulong *)buff= 0;
-  mysql_rwlock_rdlock(&LOCK_grant);
-  mysql_mutex_lock(&acl_cache->lock);
-  my_hash_iterate(&column_priv_hash, count_column_grants, buff);
-  mysql_mutex_unlock(&acl_cache->lock);
-  mysql_rwlock_unlock(&LOCK_grant);
+  if (initialized)
+  {
+    mysql_rwlock_rdlock(&LOCK_grant);
+    mysql_mutex_lock(&acl_cache->lock);
+    my_hash_iterate(&column_priv_hash, count_column_grants, buff);
+    mysql_mutex_unlock(&acl_cache->lock);
+    mysql_rwlock_unlock(&LOCK_grant);
+  }
   return 0;
 }
 
@@ -11139,12 +11208,12 @@ static void login_failed_error(THD *thd)
   my_error(access_denied_error_code(thd->password), MYF(0),
            thd->main_security_ctx.user,
            thd->main_security_ctx.host_or_ip,
-           thd->password ? ER(ER_YES) : ER(ER_NO));
+           thd->password ? ER_THD(thd, ER_YES) : ER_THD(thd, ER_NO));
   general_log_print(thd, COM_CONNECT,
-                    ER(access_denied_error_code(thd->password)),
+                    ER_THD(thd, access_denied_error_code(thd->password)),
                     thd->main_security_ctx.user,
                     thd->main_security_ctx.host_or_ip,
-                    thd->password ? ER(ER_YES) : ER(ER_NO));
+                    thd->password ? ER_THD(thd, ER_YES) : ER_THD(thd, ER_NO));
   status_var_increment(thd->status_var.access_denied_errors);
   /*
     Log access denied messages to the error log when log-warnings = 2
@@ -11153,10 +11222,10 @@ static void login_failed_error(THD *thd)
   */
   if (global_system_variables.log_warnings > 1)
   {
-    sql_print_warning(ER(access_denied_error_code(thd->password)),
+    sql_print_warning(ER_THD(thd, access_denied_error_code(thd->password)),
                       thd->main_security_ctx.user,
                       thd->main_security_ctx.host_or_ip,
-                      thd->password ? ER(ER_YES) : ER(ER_NO));
+                      thd->password ? ER_THD(thd, ER_YES) : ER_THD(thd, ER_NO));
   }
 }
 
@@ -11297,14 +11366,16 @@ static bool secure_auth(THD *thd)
     my_error(ER_SERVER_IS_IN_SECURE_AUTH_MODE, MYF(0),
              thd->security_ctx->user,
              thd->security_ctx->host_or_ip);
-    general_log_print(thd, COM_CONNECT, ER(ER_SERVER_IS_IN_SECURE_AUTH_MODE),
+    general_log_print(thd, COM_CONNECT,
+                      ER_THD(thd, ER_SERVER_IS_IN_SECURE_AUTH_MODE),
                       thd->security_ctx->user,
                       thd->security_ctx->host_or_ip);
   }
   else
   {
     my_error(ER_NOT_SUPPORTED_AUTH_MODE, MYF(0));
-    general_log_print(thd, COM_CONNECT, ER(ER_NOT_SUPPORTED_AUTH_MODE));
+    general_log_print(thd, COM_CONNECT,
+                      ER_THD(thd, ER_NOT_SUPPORTED_AUTH_MODE));
   }
   return 1;
 }
@@ -11376,7 +11447,8 @@ static bool send_plugin_request_packet(MPVIO_EXT *mpvio,
   if (switch_from_short_to_long_scramble)
   {
     my_error(ER_NOT_SUPPORTED_AUTH_MODE, MYF(0));
-    general_log_print(mpvio->thd, COM_CONNECT, ER(ER_NOT_SUPPORTED_AUTH_MODE));
+    general_log_print(mpvio->thd, COM_CONNECT,
+                      ER_THD(mpvio->thd, ER_NOT_SUPPORTED_AUTH_MODE));
     DBUG_RETURN (1);
   }
 
@@ -11453,7 +11525,8 @@ static bool find_mpvio_user(MPVIO_EXT *mpvio)
     DBUG_ASSERT(my_strcasecmp(system_charset_info, mpvio->acl_user->plugin.str,
                               old_password_plugin_name.str));
     my_error(ER_NOT_SUPPORTED_AUTH_MODE, MYF(0));
-    general_log_print(mpvio->thd, COM_CONNECT, ER(ER_NOT_SUPPORTED_AUTH_MODE));
+    general_log_print(mpvio->thd, COM_CONNECT,
+                      ER_THD(mpvio->thd, ER_NOT_SUPPORTED_AUTH_MODE));
     DBUG_RETURN (1);
   }
 
@@ -11527,7 +11600,8 @@ static bool parse_com_change_user_packet(MPVIO_EXT *mpvio, uint packet_length)
 
   if (passwd >= end)
   {
-    my_message(ER_UNKNOWN_COM_ERROR, ER(ER_UNKNOWN_COM_ERROR), MYF(0));
+    my_message(ER_UNKNOWN_COM_ERROR, ER_THD(thd, ER_UNKNOWN_COM_ERROR),
+               MYF(0));
     DBUG_RETURN (1);
   }
 
@@ -11551,7 +11625,8 @@ static bool parse_com_change_user_packet(MPVIO_EXT *mpvio, uint packet_length)
   */
   if (db >= end)
   {
-    my_message(ER_UNKNOWN_COM_ERROR, ER(ER_UNKNOWN_COM_ERROR), MYF(0));
+    my_message(ER_UNKNOWN_COM_ERROR, ER_THD(thd, ER_UNKNOWN_COM_ERROR),
+               MYF(0));
     DBUG_RETURN (1);
   }
 
@@ -11609,7 +11684,8 @@ static bool parse_com_change_user_packet(MPVIO_EXT *mpvio, uint packet_length)
   {
     if (next_field >= end)
     {
-      my_message(ER_UNKNOWN_COM_ERROR, ER(ER_UNKNOWN_COM_ERROR), MYF(0));
+      my_message(ER_UNKNOWN_COM_ERROR, ER_THD(thd, ER_UNKNOWN_COM_ERROR),
+                 MYF(0));
       DBUG_RETURN(1);
     }
     client_plugin= fix_plugin_ptr(next_field);
@@ -11633,11 +11709,12 @@ static bool parse_com_change_user_packet(MPVIO_EXT *mpvio, uint packet_length)
     }
   }
 
-  if ((mpvio->thd->client_capabilities & CLIENT_CONNECT_ATTRS) &&
+  if ((thd->client_capabilities & CLIENT_CONNECT_ATTRS) &&
       read_client_connect_attrs(&next_field, end,
-                                mpvio->thd->charset()))
+                                thd->charset()))
   {
-    my_message(ER_UNKNOWN_COM_ERROR, ER(ER_UNKNOWN_COM_ERROR), MYF(0));
+    my_message(ER_UNKNOWN_COM_ERROR, ER_THD(thd, ER_UNKNOWN_COM_ERROR),
+               MYF(0));
     DBUG_RETURN(packet_error);
   }
 
@@ -12473,7 +12550,7 @@ bool acl_authenticate(THD *thd, uint com_change_user_pkt_len)
       thd->variables.max_statement_time_double=
         acl_user->user_resource.max_statement_time;
       thd->variables.max_statement_time=
-        (thd->variables.max_statement_time_double * 1e6 + 0.1);
+        (ulonglong) (thd->variables.max_statement_time_double * 1e6 + 0.1);
     }
   }
   else

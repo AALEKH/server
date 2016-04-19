@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1995, 2014, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2013, 2014, SkySQL Ab. All Rights Reserved.
+Copyright (c) 2013, 2015, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -430,7 +430,8 @@ buf_page_get_gen(
 				BUF_GET_IF_IN_POOL_OR_WATCH */
 	const char*	file,	/*!< in: file name */
 	ulint		line,	/*!< in: line where called */
-	mtr_t*		mtr);	/*!< in: mini-transaction */
+	mtr_t*		mtr,	/*!< in: mini-transaction */
+	dberr_t*	err = NULL); /*!< out: error code */
 /********************************************************************//**
 Initializes a page to the buffer buf_pool. The page is usually not read
 from a file even if it cannot be found in the buffer buf_pool. This is one
@@ -862,7 +863,17 @@ UNIV_INLINE
 enum buf_page_state
 buf_page_get_state(
 /*===============*/
-	const buf_page_t*	bpage);	/*!< in: pointer to the control block */
+	const buf_page_t*	bpage);	/*!< in: pointer to the control
+					block */
+/*********************************************************************//**
+Gets the state name for state of a block
+@return	name or "CORRUPTED" */
+UNIV_INLINE
+const char*
+buf_get_state_name(
+/*===============*/
+	const buf_block_t*	block);	/*!< in: pointer to the control
+					block */
 /*********************************************************************//**
 Gets the state of a block.
 @return	state */
@@ -1449,9 +1460,9 @@ UNIV_INTERN
 byte*
 buf_page_encrypt_before_write(
 /*==========================*/
-	buf_page_t* page, /*!< in/out: buffer page to be flushed */
-	const byte* frame,
-	ulint space_id);
+	buf_page_t*	page,		/*!< in/out: buffer page to be flushed */
+	byte*		frame,		/*!< in: src frame */
+	ulint		space_id);	/*!< in: space id */
 
 /**********************************************************************
 The hook that is called after page is written to disk.
@@ -1506,6 +1517,9 @@ typedef struct {
 					can be read while it's being flushed */
 	byte*		comp_buf_free;	/*!< for compression, allocated
 					buffer that is then alligned */
+	byte*		out_buf;	/*!< resulting buffer after
+					encryption/compression. This is a
+					pointer and not allocated. */
 } buf_tmp_buffer_t;
 
 /** The common buffer control block structure
@@ -1579,6 +1593,14 @@ struct buf_page_t{
 					operation needed. */
 
 	unsigned        key_version;	/*!< key version for this block */
+	bool            page_encrypted; /*!< page is page encrypted */
+	bool            page_compressed;/*!< page is page compressed */
+	ulint           stored_checksum;/*!< stored page checksum if page
+					encrypted */
+	bool            encrypted;      /*!< page is still encrypted */
+	ulint           calculated_checksum;
+					/*!< calculated checksum if page
+					encrypted */
 	ulint           real_size;	/*!< Real size of the page
 					Normal pages == UNIV_PAGE_SIZE
 					page compressed pages, payload

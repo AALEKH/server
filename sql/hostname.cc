@@ -26,8 +26,9 @@
 */
 #include <my_global.h>
 #include "sql_priv.h"
+#include "unireg.h"                             // SPECIAL_NO_HOST_CACHE
 #include "hostname.h"
-#include "my_global.h"
+#include "unireg.h"
 #ifndef __WIN__
 #include <netdb.h>        // getservbyname, servent
 #endif

@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1995, 2014, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2013, 2014, SkySQL Ab. All Rights Reserved.
+Copyright (c) 2013, 2015, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -96,9 +96,6 @@ extern ulint srv_buf_pool_curr_size;
 extern buf_block_t*	back_block1;	/*!< first block, for --apply-log */
 extern buf_block_t*	back_block2;	/*!< second block, for page reorganize */
 #endif /* !UNIV_HOTBACKUP */
-
-/** Magic value to use instead of checksums when they are disabled */
-#define BUF_NO_CHECKSUM_MAGIC 0xDEADBEEFUL
 
 /** @brief States of a control block
 @see buf_page_t
@@ -218,7 +215,6 @@ dberr_t
 buf_pool_init(
 /*=========*/
 	ulint	size,		/*!< in: Size of the total pool in bytes */
-	ibool	populate,	/*!< in: Force virtual page preallocation */
 	ulint	n_instances);	/*!< in: Number of instances */
 /********************************************************************//**
 Frees the buffer pool at shutdown.  This must not be invoked before
@@ -431,7 +427,8 @@ buf_page_get_gen(
 				BUF_GET_IF_IN_POOL_OR_WATCH */
 	const char*	file,	/*!< in: file name */
 	ulint		line,	/*!< in: line where called */
-	mtr_t*		mtr);	/*!< in: mini-transaction */
+	mtr_t*		mtr,	/*!< in: mini-transaction */
+	dberr_t*	err = NULL); /*!< out: error code */
 /********************************************************************//**
 Initializes a page to the buffer buf_pool. The page is usually not read
 from a file even if it cannot be found in the buffer buf_pool. This is one
@@ -863,7 +860,17 @@ UNIV_INLINE
 enum buf_page_state
 buf_page_get_state(
 /*===============*/
-	const buf_page_t*	bpage);	/*!< in: pointer to the control block */
+	const buf_page_t*	bpage);	/*!< in: pointer to the control
+					block */
+/*********************************************************************//**
+Gets the state name for state of a block
+@return	name or "CORRUPTED" */
+UNIV_INLINE
+const char*
+buf_get_state_name(
+/*===============*/
+	const buf_block_t*	block);	/*!< in: pointer to the control
+					block */
 /*********************************************************************//**
 Gets the state of a block.
 @return	state */
@@ -1286,7 +1293,7 @@ page_hash lock is acquired in the specified lock mode. Otherwise,
 mode value is ignored. It is up to the caller to release the
 lock. If the block is found and the lock is NULL then the page_hash
 lock is released by this function.
-@return	block, NULL if not found */
+@return	block, NULL if not found, or watch sentinel (if watch is true) */
 UNIV_INLINE
 buf_page_t*
 buf_page_hash_get_locked(
@@ -1302,9 +1309,11 @@ buf_page_hash_get_locked(
 					found. NULL otherwise. If NULL
 					is passed then the hash_lock
 					is released by this function */
-	ulint		lock_mode);	/*!< in: RW_LOCK_EX or
+	ulint		lock_mode,	/*!< in: RW_LOCK_EX or
 					RW_LOCK_SHARED. Ignored if
 					lock == NULL */
+	bool		watch = false);	/*!< in: if true, return watch
+					sentinel also. */
 /******************************************************************//**
 Returns the control block of a file page, NULL if not found.
 If the block is found and lock is not NULL then the appropriate
@@ -1344,6 +1353,8 @@ buf_page_hash_get_low() function.
 	buf_page_hash_get_locked(b, s, o, l, RW_LOCK_EX)
 #define buf_page_hash_get(b, s, o)				\
 	buf_page_hash_get_locked(b, s, o, NULL, 0)
+#define buf_page_get_also_watch(b, s, o)			\
+	buf_page_hash_get_locked(b, s, o, NULL, 0, true)
 
 #define buf_block_hash_get_s_locked(b, s, o, l)			\
 	buf_block_hash_get_locked(b, s, o, l, RW_LOCK_SHARED)
@@ -1473,9 +1484,9 @@ UNIV_INTERN
 byte*
 buf_page_encrypt_before_write(
 /*==========================*/
-	buf_page_t* page, /*!< in/out: buffer page to be flushed */
-	const byte* frame,
-	ulint space_id);
+	buf_page_t*	page,		/*!< in/out: buffer page to be flushed */
+	byte*		frame,		/*!< in: src frame */
+	ulint		space_id);	/*!< in: space id */
 
 /**********************************************************************
 The hook that is called after page is written to disk.
@@ -1530,6 +1541,9 @@ typedef struct {
 					can be read while it's being flushed */
 	byte*		comp_buf_free;	/*!< for compression, allocated
 					buffer that is then alligned */
+	byte*		out_buf;	/*!< resulting buffer after
+					encryption/compression. This is a
+					pointer and not allocated. */
 } buf_tmp_buffer_t;
 
 /** The common buffer control block structure
@@ -1607,6 +1621,14 @@ struct buf_page_t{
 					operation needed. */
 
 	unsigned        key_version;    /*!< key version for this block */
+	bool            page_encrypted; /*!< page is page encrypted */
+	bool            page_compressed;/*!< page is page compressed */
+	ulint           stored_checksum;/*!< stored page checksum if page
+					encrypted */
+	bool            encrypted;      /*!< page is still encrypted */
+	ulint           calculated_checksum;
+					/*!< calculated checksum if page
+					encrypted */
 
 	ulint           real_size;	/*!< Real size of the page
 					Normal pages == UNIV_PAGE_SIZE

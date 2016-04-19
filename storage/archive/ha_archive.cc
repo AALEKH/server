@@ -56,7 +56,7 @@
   meta file is first opened it is marked as dirty. It is opened when the table 
   itself is opened for writing. When the table is closed the new count for rows 
   is written to the meta file and the file is marked as clean. If the meta file 
-  is opened and it is marked as dirty, it is assumed that a crash occured. At 
+  is opened and it is marked as dirty, it is assumed that a crash occurred. At 
   this point an error occurs and the user is told to rebuild the file.
   A rebuild scans the rows and rewrites the meta file. If corruption is found
   in the data file then the meta file is not repaired.
@@ -1873,7 +1873,7 @@ void ha_archive::destroy_record_buffer(archive_record_buffer *r)
   frm image in the ARZ file. And this cannot be done in-place, it
   requires ARZ file to be recreated from scratch
 */
-bool ha_archive::check_if_incompatible_data(HA_CREATE_INFO *info,
+bool ha_archive::check_if_incompatible_data(HA_CREATE_INFO *info_arg,
                                             uint table_changes)
 {
   return COMPATIBLE_DATA_NO;

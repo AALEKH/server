@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (C) 2013, 2014, SkySQL Ab. All Rights Reserved.
+Copyright (C) 2013, 2015, MariaDB Corporation. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -21,7 +21,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 Implementation for helper functions for extracting/storing page
 compression and atomic writes information to file space.
 
-Created 11/12/2013 Jan Lindström jan.lindstrom@skysql.com
+Created 11/12/2013 Jan Lindström jan.lindstrom@mariadb.com
+
 ***********************************************************************/
 
 /********************************************************************//**
@@ -67,7 +68,7 @@ UNIV_INLINE
 ibool
 fil_page_is_index_page(
 /*===================*/
-	byte *buf)	/*!< in: page */
+	byte*	buf)	/*!< in: page */
 {
 	return(mach_read_from_2(buf+FIL_PAGE_TYPE) == FIL_PAGE_INDEX);
 }
@@ -79,15 +80,28 @@ UNIV_INLINE
 ibool
 fil_page_is_compressed(
 /*===================*/
-	byte *buf)	/*!< in: page */
+	byte*	buf)	/*!< in: page */
 {
 	return(mach_read_from_2(buf+FIL_PAGE_TYPE) == FIL_PAGE_PAGE_COMPRESSED);
 }
 
 /*******************************************************************//**
+Find out wheather the page is page compressed
+@return	true if page is page compressed, false if not */
+UNIV_INLINE
+ibool
+fil_page_is_compressed_encrypted(
+/*=============================*/
+	byte*	buf)	/*!< in: page */
+{
+	return(mach_read_from_2(buf+FIL_PAGE_TYPE) == FIL_PAGE_PAGE_COMPRESSED_ENCRYPTED);
+}
+
+#ifndef UNIV_INNOCHECKSUM
+/*******************************************************************//**
 Returns the page compression level of the space, or 0 if the space
 is not compressed. The tablespace must be cached in the memory cache.
-@return	page compression level, ULINT_UNDEFINED if space not found */
+@return	page compression level, 0 if space not found */
 UNIV_INLINE
 ulint
 fil_space_get_page_compression_level(
@@ -103,7 +117,7 @@ fil_space_get_page_compression_level(
 		return(fsp_flags_get_page_compression_level(flags));
 	}
 
-	return(flags);
+	return(0);
 }
 
 /*******************************************************************//**
@@ -125,8 +139,10 @@ fil_space_is_page_compressed(
 		return(fsp_flags_is_page_compressed(flags));
 	}
 
-	return(flags);
+	return(0);
 }
+
+#endif /* UNIV_INNOCHECKSUM */
 
 /****************************************************************//**
 Get the name of the compression algorithm used for page
@@ -136,7 +152,7 @@ UNIV_INLINE
 const char*
 fil_get_compression_alg_name(
 /*=========================*/
-       ulint           comp_alg)     /*!<in: compression algorithm number */
+       ulint	comp_alg)	/*!<in: compression algorithm number */
 {
 	switch(comp_alg) {
 	case PAGE_UNCOMPRESSED:
@@ -154,13 +170,19 @@ fil_get_compression_alg_name(
 	case PAGE_LZMA_ALGORITHM:
 		return ("LZMA");
 		break;
-	default:
-		return("UNKNOWN");
-		ut_error;
+	case PAGE_BZIP2_ALGORITHM:
+		return ("BZIP2");
 		break;
+	case PAGE_SNAPPY_ALGORITHM:
+		return ("SNAPPY");
+		break;
+	/* No default to get compiler warning */
 	}
+
+	return ("NULL");
 }
 
+#ifndef UNIV_INNOCHECKSUM
 /*******************************************************************//**
 Returns the atomic writes flag of the space, or false if the space
 is not using atomic writes. The tablespace must be cached in the memory cache.
@@ -190,8 +212,12 @@ UNIV_INLINE
 ibool
 fil_page_is_lzo_compressed(
 /*=======================*/
-	byte *buf)	/*!< in: page */
+	byte*	buf)	/*!< in: page */
 {
-	return(mach_read_from_2(buf+FIL_PAGE_TYPE) == FIL_PAGE_PAGE_COMPRESSED &&
-	       mach_read_from_8(buf+FIL_PAGE_FILE_FLUSH_LSN_OR_KEY_VERSION) == PAGE_LZO_ALGORITHM);
+	return((mach_read_from_2(buf+FIL_PAGE_TYPE) == FIL_PAGE_PAGE_COMPRESSED &&
+			mach_read_from_8(buf+FIL_PAGE_FILE_FLUSH_LSN_OR_KEY_VERSION) == PAGE_LZO_ALGORITHM) ||
+	       (mach_read_from_2(buf+FIL_PAGE_TYPE) == FIL_PAGE_PAGE_COMPRESSED_ENCRYPTED &&
+			mach_read_from_2(buf+FIL_PAGE_DATA+FIL_PAGE_COMPRESSED_SIZE) == PAGE_LZO_ALGORITHM));
 }
+
+#endif /* UNIV_INNOCHECKSUM */

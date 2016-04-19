@@ -2102,6 +2102,19 @@ count(*)
 40960
 drop table t1;
 set names default;
+create table t2 (a int, b int, c int, d int, key x(a, b));
+insert into t2 values (2, 2, 2, 2), (3, 3, 3, 3), (4, 4, 4, 4), (5, 5, 5, 5),
+(6, 6, 6, 6), (7, 7, 7, 7), (8, 8, 8, 8), (9, 9, 9, 9);
+insert into t2 select * from t2;
+insert into t2 values (0, 0, 0, 0), (1, 1, 1, 1);
+analyze table t2;
+Table	Op	Msg_type	Msg_text
+test.t2	analyze	status	OK
+select a, b from t2 where (a, b) in ((0, 0), (1, 1));
+a	b
+0	0
+1	1
+drop table t2;
 #
 # BUG#13731380: RANGE OPTIMIZER CALLS RECORDS_IN_RANGE() FOR OPEN RANGE
 #
@@ -2243,4 +2256,40 @@ id	select_type	table	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 Warnings:
 Note	1003	select `test`.`t2`.`a` AS `a`,`test`.`t2`.`b` AS `b`,`test`.`t2`.`c` AS `c` from `test`.`t2` where 0
 drop table t1,t2;
+#
+# Start of 10.1 tests
+#
+#
+# MDEV-8189 field<>const and const<>field are not symmetric
+#
+CREATE TABLE t1 (a INT, b INT, KEY(a));
+INSERT INTO t1 (a) VALUES (10),(10),(10),(10),(10),(10),(10),(10),(10),(10),(70);
+EXPLAIN SELECT * FROM t1 WHERE a<>10;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	t1	range	a	a	5	NULL	3	Using index condition; Rowid-ordered scan
+EXPLAIN SELECT * FROM t1 WHERE 10<>a;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	t1	range	a	a	5	NULL	3	Using index condition; Rowid-ordered scan
+SELECT * FROM t1 WHERE a<>10;
+a	b
+70	NULL
+SELECT * FROM t1 WHERE 10<>a;
+a	b
+70	NULL
+DROP TABLE t1;
+#
+# MDEV-8613 Full table scan for WHERE indexed_varchar_column <=> 'bad-character'
+#
+SET NAMES utf8;
+CREATE TABLE t1 (a VARCHAR(10) CHARACTER SET utf8, KEY(a)) ENGINE=MyISAM;
+INSERT INTO t1 VALUES ('a'),('b'),('c'),('d'),('e');
+EXPLAIN SELECT * FROM t1 WHERE a<=>'😎';
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	NULL	NULL	NULL	NULL	NULL	NULL	NULL	Impossible WHERE noticed after reading const tables
+Warnings:
+Warning	1366	Incorrect string value: '\xF0\x9F\x98\x8E' for column 'a' at row 1
+DROP TABLE t1;
+#
+# End of 10.1 tests
+#
 set optimizer_switch=@mrr_icp_extra_tmp;

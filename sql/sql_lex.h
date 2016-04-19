@@ -1,5 +1,5 @@
-/* Copyright (c) 2000, 2014, Oracle and/or its affiliates.
-   Copyright (c) 2010, 2014, Monty Program Ab.
+/* Copyright (c) 2000, 2015, Oracle and/or its affiliates.
+   Copyright (c) 2010, 2016, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -47,6 +47,7 @@ class sys_var;
 class Item_func_match;
 class File_parser;
 class Key_part_spec;
+struct sql_digest_state;
 
 #define ALLOC_ROOT_SET 1024
 
@@ -525,7 +526,6 @@ public:
   void exclude();
   void exclude_from_tree();
 
-  virtual st_select_lex_unit* master_unit()= 0;
   virtual st_select_lex* outer_select()= 0;
   virtual st_select_lex* return_after_parsing()= 0;
 
@@ -631,7 +631,7 @@ public:
       return saved_fake_select_lex;
     return first_select();
   };
-  //node on wich we should return current_select pointer after parsing subquery
+  //node on which we should return current_select pointer after parsing subquery
   st_select_lex *return_to;
   /* LIMIT clause runtime counters */
   ha_rows select_limit_cnt, offset_limit_cnt;
@@ -667,7 +667,6 @@ public:
   TABLE *insert_table_with_stored_vcol;
 
   void init_query();
-  st_select_lex_unit* master_unit();
   st_select_lex* outer_select();
   st_select_lex* first_select()
   {
@@ -781,7 +780,8 @@ public:
   List<TABLE_LIST> leaf_tables;
   List<TABLE_LIST> leaf_tables_exec;
   List<TABLE_LIST> leaf_tables_prep;
-  bool is_prep_leaf_list_saved;
+  enum leaf_list_state {UNINIT, READY, SAVED};
+  enum leaf_list_state prep_leaf_list_state;
   uint insert_tables;
   st_select_lex *merged_into; /* select which this select is merged into */
                               /* (not 0 only for views/derived tables)   */
@@ -801,7 +801,7 @@ public:
     list during split_sum_func
   */
   uint select_n_having_items;
-  uint cond_count;    /* number of arguments of and/or/xor in where/having/on */
+  uint cond_count;    /* number of sargable Items in where/having/on          */
   uint between_count; /* number of between predicates in where/having/on      */
   uint max_equal_elems; /* maximal number of elements in multiple equalities  */   
   /*
@@ -870,8 +870,6 @@ public:
   bool no_wrap_view_item;
   /* exclude this select from check of unique_table() */
   bool exclude_from_table_unique_test;
-  /* List of fields that aren't under an aggregate function */
-  List<Item_field> non_agg_fields;
   /* index in the select list of the expression currently being fixed */
   int cur_pos_in_select_list;
 
@@ -897,7 +895,7 @@ public:
 
   void init_query();
   void init_select();
-  st_select_lex_unit* master_unit();
+  st_select_lex_unit* master_unit() { return (st_select_lex_unit*) master; }
   st_select_lex_unit* first_inner_unit() 
   { 
     return (st_select_lex_unit*) slave; 
@@ -926,7 +924,7 @@ public:
 
   bool add_item_to_list(THD *thd, Item *item);
   bool add_group_to_list(THD *thd, Item *item, bool asc);
-  bool add_ftfunc_to_list(Item_func_match *func);
+  bool add_ftfunc_to_list(THD *thd, Item_func_match *func);
   bool add_order_to_list(THD *thd, Item *item, bool asc);
   bool add_gorder_to_list(THD *thd, Item *item, bool asc);
   TABLE_LIST* add_table_to_list(THD *thd, Table_ident *table,
@@ -1078,6 +1076,13 @@ private:
   index_clause_map current_index_hint_clause;
   /* a list of USE/FORCE/IGNORE INDEX */
   List<Index_hint> *index_hints;
+
+public:
+  inline void add_where_field(st_select_lex *sel)
+  {
+    DBUG_ASSERT(this != sel);
+    select_n_where_fields+= sel->select_n_where_fields;
+  }
 };
 typedef class st_select_lex SELECT_LEX;
 
@@ -1411,6 +1416,11 @@ public:
   */
   inline bool is_stmt_unsafe() const {
     return get_stmt_unsafe_flags() != 0;
+  }
+
+  inline bool is_stmt_unsafe(enum_binlog_stmt_unsafe unsafe)
+  {
+    return binlog_stmt_flags & (1 << unsafe);
   }
 
   /**
@@ -1809,6 +1819,7 @@ class Lex_input_stream
 {
   size_t unescape(CHARSET_INFO *cs, char *to,
                   const char *str, const char *end, int sep);
+  my_charset_conv_wc_mb get_escape_func(THD *thd, my_wc_t sep) const;
 public:
   Lex_input_stream()
   {
@@ -2079,14 +2090,23 @@ public:
     return (uint) (m_body_utf8_ptr - m_body_utf8);
   }
 
+  /**
+    Get the maximum length of the utf8-body buffer.
+    The utf8 body can grow because of the character set conversion and escaping.
+  */
+  uint get_body_utf8_maximum_length(THD *thd);
+
   void body_utf8_start(THD *thd, const char *begin_ptr);
   void body_utf8_append(const char *ptr);
   void body_utf8_append(const char *ptr, const char *end_ptr);
-  void body_utf8_append_literal(THD *thd,
-                                const LEX_STRING *txt,
-                                CHARSET_INFO *txt_cs,
-                                const char *end_ptr);
-
+  void body_utf8_append_ident(THD *thd,
+                              const LEX_STRING *txt,
+                              const char *end_ptr);
+  void body_utf8_append_escape(THD *thd,
+                               const LEX_STRING *txt,
+                               CHARSET_INFO *txt_cs,
+                               const char *end_ptr,
+                               my_wc_t sep);
   /** Current thread. */
   THD *m_thd;
 
@@ -2107,7 +2127,12 @@ public:
   /** LALR(2) resolution, value of the look ahead token.*/
   LEX_YYSTYPE lookahead_yylval;
 
-  bool get_text(LEX_STRING *to, int pre_skip, int post_skip);
+  bool get_text(LEX_STRING *to, uint sep, int pre_skip, int post_skip);
+
+  void add_digest_token(uint token, LEX_YYSTYPE yylval);
+
+  void reduce_digest_token(uint token_left, uint token_right);
+
 private:
   /** Pointer to the current position in the raw input stream. */
   char *m_ptr;
@@ -2227,7 +2252,7 @@ public:
   /**
     Current statement digest instrumentation. 
   */
-  PSI_digest_locker* m_digest_psi;
+  sql_digest_state* m_digest;
 };
 
 /**
@@ -2368,6 +2393,10 @@ public:
     deleting_all_rows= true;
     scanned_rows= rows_arg;
   }
+  void cancel_delete_all_rows()
+  {
+    deleting_all_rows= false;
+  }
 
   Explain_delete* save_explain_delete_data(MEM_ROOT *mem_root, THD *thd);
 };
@@ -2413,6 +2442,8 @@ struct LEX: public Query_tables_list
 
   /** SELECT of CREATE VIEW statement */
   LEX_STRING create_view_select;
+
+  uint number_of_selects; // valid only for view
 
   /** Start of 'ON table', in trigger statements.  */
   const char* raw_trg_on_table_name_begin;
@@ -2480,6 +2511,7 @@ public:
   USER_RESOURCES mqh;
   LEX_RESET_SLAVE reset_slave_info;
   ulonglong type;
+  ulong next_binlog_file_number;
   /* The following is used by KILL */
   killed_state kill_signal;
   killed_type  kill_type;
@@ -2839,6 +2871,8 @@ public:
     return FALSE;
   }
 
+  bool save_prep_leaf_tables();
+
   int print_explain(select_result_sink *output, uint8 explain_flags,
                     bool is_analyze, bool *printed_anything);
   void restore_set_statement_var();
@@ -2857,21 +2891,21 @@ public:
     return false;
   }
   // Add a key as a part of CREATE TABLE or ALTER TABLE
-  bool add_key(Key::Keytype type, const LEX_STRING &name,
+  bool add_key(Key::Keytype key_type, const LEX_STRING &key_name,
                ha_key_alg algorithm, DDL_options_st ddl)
   {
     if (check_add_key(ddl) ||
-        !(last_key= new Key(type, name, algorithm, false, ddl)))
+        !(last_key= new Key(key_type, key_name, algorithm, false, ddl)))
       return true;
     alter_info.key_list.push_back(last_key);
     return false;
   }
   // Add a key for a CREATE INDEX statement
-  bool add_create_index(Key::Keytype type, const LEX_STRING &name,
+  bool add_create_index(Key::Keytype key_type, const LEX_STRING &key_name,
                         ha_key_alg algorithm, DDL_options_st ddl)
   {
     if (check_create_options(ddl) ||
-       !(last_key= new Key(type, name, algorithm, false, ddl)))
+       !(last_key= new Key(key_type, key_name, algorithm, false, ddl)))
       return true;
     alter_info.key_list.push_back(last_key);
     return false;
@@ -3039,6 +3073,18 @@ public:
 };
 
 /**
+  Input parameters to the parser.
+*/
+struct Parser_input
+{
+  bool m_compute_digest;
+
+  Parser_input()
+    : m_compute_digest(false)
+  {}
+};
+
+/**
   Internal state of the parser.
   The complete state consist of:
   - state data used during lexical parsing,
@@ -3065,8 +3111,14 @@ public:
   ~Parser_state()
   {}
 
+  Parser_input m_input;
   Lex_input_stream m_lip;
   Yacc_state m_yacc;
+
+  /**
+    Current performance digest instrumentation. 
+  */
+  PSI_digest_locker* m_digest_psi;
 
   void reset(char *found_semicolon, unsigned int length)
   {
@@ -3075,6 +3127,11 @@ public:
   }
 };
 
+extern sql_digest_state *
+digest_add_token(sql_digest_state *state, uint token, LEX_YYSTYPE yylval);
+
+extern sql_digest_state *
+digest_reduce_token(sql_digest_state *state, uint token_left, uint token_right);
 
 struct st_lex_local: public LEX, public Sql_alloc
 {
@@ -3084,6 +3141,8 @@ extern void lex_init(void);
 extern void lex_free(void);
 extern void lex_start(THD *thd);
 extern void lex_end(LEX *lex);
+extern void lex_end_stage1(LEX *lex);
+extern void lex_end_stage2(LEX *lex);
 void end_lex_with_single_table(THD *thd, TABLE *table, LEX *old_lex);
 int init_lex_with_single_table(THD *thd, TABLE *table, LEX *lex);
 extern int MYSQLlex(union YYSTYPE *yylval, THD *thd);

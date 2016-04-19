@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2013, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2015, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2008, Google Inc.
 
 Portions of this file contain modifications contributed and copyrighted by
@@ -297,9 +297,9 @@ mutex_create_func(
 
 	/* NOTE! The very first mutexes are not put to the mutex list */
 
-	if ((mutex == &mutex_list_mutex)
+	if (mutex == &mutex_list_mutex
 #ifdef UNIV_SYNC_DEBUG
-	    || (mutex == &sync_thread_mutex)
+	    || mutex == &sync_thread_mutex
 #endif /* UNIV_SYNC_DEBUG */
 	    ) {
 
@@ -422,7 +422,13 @@ mutex_validate(
 	const ib_mutex_t*	mutex)	/*!< in: mutex */
 {
 	ut_a(mutex);
-	ut_a(mutex->magic_n == MUTEX_MAGIC_N);
+
+	if (mutex->magic_n != MUTEX_MAGIC_N) {
+		ib_logf(IB_LOG_LEVEL_ERROR,
+			"Mutex %p not initialized file %s line %lu.",
+			mutex, mutex->cfile_name, mutex->cline);
+	}
+	ut_ad(mutex->magic_n == MUTEX_MAGIC_N);
 
 	return(TRUE);
 }

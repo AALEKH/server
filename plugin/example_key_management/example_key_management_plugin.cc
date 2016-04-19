@@ -36,24 +36,25 @@
 #define KEY_ROTATION_MAX 90
 
 static struct my_rnd_struct seed;
-static unsigned int key_version = 0;
-static unsigned int next_key_version = 0;
+static time_t key_version = 0;
+static time_t next_key_version = 0;
 static pthread_mutex_t mutex;
 
 static unsigned int
 get_latest_key_version(unsigned int key_id)
 {
-  uint now = time(0);
+  time_t now = time(0);
   pthread_mutex_lock(&mutex);
   if (now >= next_key_version)
   {
     key_version = now;
     unsigned int interval = KEY_ROTATION_MAX - KEY_ROTATION_MIN;
-    next_key_version = now + KEY_ROTATION_MIN + my_rnd(&seed) * interval;
+    next_key_version = (time_t) (now + KEY_ROTATION_MIN +
+                                 my_rnd(&seed) * interval);
   }
   pthread_mutex_unlock(&mutex);
 
-  return key_version;
+  return (unsigned int) key_version;
 }
 
 static unsigned int
@@ -77,26 +78,24 @@ get_key(unsigned int key_id, unsigned int version,
 
 /*
   for the sake of an example, let's use different encryption algorithms/modes
-  for different keys.
+  for different keys versions:
 */
-int encrypt(const unsigned char* src, unsigned int slen,
-            unsigned char* dst, unsigned int* dlen,
-            const unsigned char* key, unsigned int klen,
-            const unsigned char* iv, unsigned int ivlen,
-            int no_padding, unsigned int keyid, unsigned int key_version)
+static inline enum my_aes_mode mode(unsigned int key_version)
 {
-  return ((key_version & 1) ? my_aes_encrypt_cbc : my_aes_encrypt_ecb)
-    (src, slen, dst, dlen, key, klen, iv, ivlen, no_padding);
+  return key_version & 1 ? MY_AES_ECB : MY_AES_CBC;
 }
 
-int decrypt(const unsigned char* src, unsigned int slen,
-            unsigned char* dst, unsigned int* dlen,
-            const unsigned char* key, unsigned int klen,
-            const unsigned char* iv, unsigned int ivlen,
-            int no_padding, unsigned int keyid, unsigned int key_version)
+int ctx_init(void *ctx, const unsigned char* key, unsigned int klen, const
+             unsigned char* iv, unsigned int ivlen, int flags, unsigned int
+             key_id, unsigned int key_version)
 {
-  return ((key_version & 1) ? my_aes_decrypt_cbc : my_aes_decrypt_ecb)
-    (src, slen, dst, dlen, key, klen, iv, ivlen, no_padding);
+  return my_aes_crypt_init(ctx, mode(key_version), flags, key, klen, iv, ivlen);
+}
+
+static unsigned int get_length(unsigned int slen, unsigned int key_id,
+                               unsigned int key_version)
+{
+  return my_aes_get_size(mode(key_version), slen);
 }
 
 static int example_key_management_plugin_init(void *p)
@@ -119,8 +118,11 @@ struct st_mariadb_encryption example_key_management_plugin= {
   MariaDB_ENCRYPTION_INTERFACE_VERSION,
   get_latest_key_version,
   get_key,
-  encrypt,
-  decrypt
+  (uint (*)(unsigned int, unsigned int))my_aes_ctx_size,
+  ctx_init,
+  my_aes_crypt_update,
+  my_aes_crypt_finish,
+  get_length
 };
 
 /*

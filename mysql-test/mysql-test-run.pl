@@ -354,6 +354,7 @@ my $opt_max_save_datadir= env_or_val(MTR_MAX_SAVE_DATADIR => 20);
 my $opt_max_test_fail= env_or_val(MTR_MAX_TEST_FAIL => 10);
 
 my $opt_parallel= $ENV{MTR_PARALLEL} || 1;
+my $opt_port_group_size = $ENV{MTR_PORT_GROUP_SIZE} || 20;
 
 # lock file to stop tests
 my $opt_stop_file= $ENV{MTR_STOP_FILE};
@@ -1013,15 +1014,7 @@ sub ignore_option {
 
 # Setup any paths that are $opt_vardir related
 sub set_vardir {
-  my ($vardir)= @_;
-  if(IS_WINDOWS)
-  {
-    $opt_vardir= $vardir;
-  }
-  else
-  {
-    $opt_vardir= realpath($vardir);
-  }
+  ($opt_vardir)= @_;
 
   $path_vardir_trace= $opt_vardir;
   # Chop off any "c:", DBUG likes a unix path ex: c:/src/... => /src/...
@@ -1068,7 +1061,6 @@ sub print_global_resfile {
   resfile_global("shutdown-timeout", $opt_shutdown_timeout ? 1 : 0);
   resfile_global("warnings", $opt_warnings ? 1 : 0);
   resfile_global("max-connections", $opt_max_connections);
-#  resfile_global("default-myisam", $opt_default_myisam ? 1 : 0);
   resfile_global("product", "MySQL");
   # Somewhat hacky code to convert numeric version back to dot notation
   my $v1= int($mysql_version_id / 10000);
@@ -1125,6 +1117,7 @@ sub command_line_setup {
              # Specify ports
 	     'build-thread|mtr-build-thread=i' => \$opt_build_thread,
 	     'port-base|mtr-port-base=i'       => \$opt_port_base,
+	     'port-group-size=s'        => \$opt_port_group_size,
 
              # Test case authoring
              'record'                   => \$opt_record,
@@ -1226,7 +1219,6 @@ sub command_line_setup {
              'stop-file=s'              => \$opt_stop_file,
              'stop-keep-alive=i'        => \$opt_stop_keep_alive,
 	     'max-connections=i'        => \$opt_max_connections,
-	     'default-myisam!'          => \&collect_option,
 	     'report-times'             => \$opt_report_times,
 	     'result-file'              => \$opt_resfile,
 	     'stress=s'                 => \$opt_stress,
@@ -1452,7 +1444,7 @@ sub command_line_setup {
     # Search through list of locations that are known
     # to be "fast disks" to find a suitable location
     # Use --mem=<dir> as first location to look.
-    my @tmpfs_locations= ($opt_mem, "/dev/shm", "/tmp");
+    my @tmpfs_locations= ($opt_mem,"/run/shm", "/dev/shm", "/tmp");
 
     foreach my $fs (@tmpfs_locations)
     {
@@ -1468,20 +1460,11 @@ sub command_line_setup {
   # --------------------------------------------------------------------------
   # Set the "var/" directory, the base for everything else
   # --------------------------------------------------------------------------
-  if(defined $ENV{MTR_BINDIR})
-  {
-    $default_vardir= "$ENV{MTR_BINDIR}/mysql-test/var";
-  }
-  else
-  {
-    $default_vardir= "$glob_mysql_test_dir/var";
-  }
-  unless (IS_WINDOWS) {
-    my $realpath = realpath($default_vardir);
-    die "realpath('$default_vardir') failed: $!\n"
-      unless defined($realpath) && $realpath ne '';
-    $default_vardir = $realpath;
-  }
+  my $vardir_location= (defined $ENV{MTR_BINDIR} 
+                          ? "$ENV{MTR_BINDIR}/mysql-test" 
+                          : $glob_mysql_test_dir);
+  $vardir_location= realpath $vardir_location unless IS_WINDOWS;
+  $default_vardir= "$vardir_location/var";
 
   if ( ! $opt_vardir )
   {
@@ -1825,16 +1808,16 @@ sub set_build_thread_ports($) {
   $ENV{MTR_BUILD_THREAD}= $build_thread;
 
   # Calculate baseport
-  $baseport= $build_thread * 20 + 10000;
-  if ( $baseport < 5001 or $baseport + 19 >= 32767 )
+  $baseport= $build_thread * $opt_port_group_size + 10000;
+  if ( $baseport < 5001 or $baseport + $opt_port_group_size >= 32767 )
   {
     mtr_error("MTR_BUILD_THREAD number results in a port",
               "outside 5001 - 32767",
-              "($baseport - $baseport + 19)");
+              "($baseport - $baseport + $opt_port_group_size)");
   }
 
   mtr_report("Using MTR_BUILD_THREAD $build_thread,",
-	     "with reserved ports $baseport..".($baseport+19));
+	     "with reserved ports $baseport..".($baseport+($opt_port_group_size-1)));
 
 }
 
@@ -2596,15 +2579,18 @@ sub setup_vardir() {
   {
     $plugindir="$opt_vardir/plugins";
     mkpath($plugindir);
-    if (IS_WINDOWS && !$opt_embedded_server)
+    if (IS_WINDOWS)
     {
-      for (<$bindir/storage/*$opt_vs_config/*.dll>,
-           <$bindir/plugin/*$opt_vs_config/*.dll>,
-           <$bindir/sql$opt_vs_config/*.dll>)
+      if (!$opt_embedded_server)
       {
-        my $pname=basename($_);
-        copy rel2abs($_), "$plugindir/$pname";
-        set_plugin_var($pname);
+        for (<$bindir/storage/*$opt_vs_config/*.dll>,
+             <$bindir/plugin/*$opt_vs_config/*.dll>,
+             <$bindir/sql$opt_vs_config/*.dll>)
+        {
+          my $pname=basename($_);
+          copy rel2abs($_), "$plugindir/$pname";
+          set_plugin_var($pname);
+        }
       }
     }
     else
@@ -2985,8 +2971,8 @@ sub kill_leftovers ($) {
 sub check_ports_free ($)
 {
   my $bthread= shift;
-  my $portbase = $bthread * 10 + 10000;
-  for ($portbase..$portbase+9){
+  my $portbase = $bthread * $opt_port_group_size + 10000;
+  for ($portbase..$portbase+($opt_port_group_size-1)){
     if (mtr_ping_port($_)){
       mtr_report(" - 'localhost:$_' was not free");
       return 0; # One port was not free
@@ -3355,7 +3341,7 @@ sub do_before_run_mysqltest($)
     my $resdir= dirname($resfile);
     # we'll use a separate extension for generated result files
     # to be able to distinguish them from manually created
-    # version-controlled results, and to ignore them in bzr.
+    # version-controlled results, and to ignore them in git.
     my $dest = "$base_file$suites.result~";
     my @cmd = ($exe_patch, qw/--binary -r - -f -s -o/,
                $dest, $base_result, $resfile);
@@ -4389,6 +4375,9 @@ sub extract_warning_lines ($$) {
      qr/InnoDB: Warning: a long semaphore wait:/,
      qr/InnoDB: Disabling redo log encryption/,
      qr/InnoDB: Redo log crypto: Can't initialize to key version -1u/,
+     qr/InnoDB: Dumping buffer pool.*/,
+     qr/InnoDB: Buffer pool.*/,
+     qr/InnoDB: Warning: Writer thread is waiting this semaphore/,
      qr/Slave: Unknown table 't1' .* 1051/,
      qr/Slave SQL:.*(Internal MariaDB error code: [[:digit:]]+|Query:.*)/,
      qr/slave SQL thread aborted/,
@@ -4444,6 +4433,22 @@ sub extract_warning_lines ($$) {
      qr|InnoDB: Setting thread \d+ nice to \d+ failed, current nice \d+, errno 13|, # setpriority() fails under valgrind
      qr|Failed to setup SSL|,
      qr|SSL error: Failed to set ciphers to use|,
+     qr/Plugin 'InnoDB' will be forced to shutdown/,
+     qr|Could not increase number of max_open_files to more than|,
+     qr/InnoDB: Error table encrypted but encryption service not available.*/,
+     qr/InnoDB: Could not find a valid tablespace file for*/,
+     qr/InnoDB: Tablespace open failed for*/,
+     qr/InnoDB: Failed to find tablespace for table*/,
+     qr/InnoDB: Space */,
+     qr|InnoDB: You may have to recover from a backup|,
+     qr|InnoDB: It is also possible that your operatingsystem has corrupted its own file cache|,
+     qr|InnoDB: and rebooting your computer removes the error|,
+     qr|InnoDB: If the corrupt page is an index page you can also try to|,
+     qr|nnoDB: fix the corruption by dumping, dropping, and reimporting|,
+     qr|InnoDB: the corrupt table. You can use CHECK|,
+     qr|InnoDB: TABLE to scan your table for corruption|,
+     qr/InnoDB: See also */
+
     );
 
   my $matched_lines= [];
@@ -5486,6 +5491,12 @@ sub start_mysqltest ($) {
     mtr_add_arg($args, "--max-connections=%d", $opt_max_connections);
   }
 
+  if ( $opt_valgrind )
+  {
+    # Longer timeouts when running with valgrind
+    mtr_add_arg($args, "--wait-longer-for-timeouts");
+  }
+
   if ( $opt_embedded_server )
   {
 
@@ -5982,10 +5993,10 @@ Options to control what engine/variation to run:
   non-blocking-api      Use the non-blocking client API
   compress              Use the compressed protocol between client and server
   ssl                   Use ssl protocol between client and server
-  skip-ssl              Dont start server with support for ssl connections
+  skip-ssl              Don't start server with support for ssl connections
   vs-config             Visual Studio configuration used to create executables
                         (default: MTR_VS_CONFIG environment variable)
-  parallel=#            How many parallell test should be run
+  parallel=#            How many parallel test should be run
   defaults-file=<config template> Use fixed config template for all
                         tests
   defaults-extra-file=<config template> Extra config template to add to
@@ -6004,7 +6015,7 @@ Options to control directories to use
   mem                   Run testsuite in "memory" using tmpfs or ramdisk
                         Attempts to find a suitable location
                         using a builtin list of standard locations
-                        for tmpfs (/dev/shm)
+                        for tmpfs (/run/shm, /dev/shm, /tmp)
                         The option can also be set using environment
                         variable MTR_MEM=[DIR]
   clean-vardir          Clean vardir if tests were successful and if
@@ -6043,6 +6054,8 @@ Options to control what test suites or cases to run
   skip-test-list=FILE   Skip the tests listed in FILE. Each line in the file
                         is an entry and should be formatted as: 
                         <TESTNAME> : <COMMENT>
+  force-restart         Always restart servers between tests. This makes it
+                        easier to see from which test warnings may come from.
 
 Options that specify ports
 
@@ -6055,6 +6068,8 @@ Options that specify ports
   build-thread=#        Can be set in environment variable MTR_BUILD_THREAD.
                         Set  MTR_BUILD_THREAD="auto" to automatically aquire
                         a build thread id that is unique to current host
+  port-group-size=N     Reserve groups of TCP ports of size N for each MTR thread
+
 
 Options for test case authoring
 
@@ -6111,7 +6126,7 @@ Options for debugging the product
                         up disks for heavily crashing server). Defaults to
                         $opt_max_save_datadir, set to 0 for no limit. Set
                         it's default with MTR_MAX_SAVE_DATADIR
-  max-test-fail         Limit the number of test failurs before aborting
+  max-test-fail         Limit the number of test failures before aborting
                         the current test run. Defaults to
                         $opt_max_test_fail, set to 0 for no limit. Set
                         it's default with MTR_MAX_TEST_FAIL
@@ -6158,9 +6173,8 @@ Misc options
                         --mysqld (if any)
   wait-all              If --start or --start-dirty option is used, wait for all
                         servers to exit before finishing the process
-  fast                  Run as fast as possible, dont't wait for servers
+  fast                  Run as fast as possible, don't wait for servers
                         to shutdown etc.
-  force-restart         Always restart servers between tests
   parallel=N            Run tests in N parallel threads (default 1)
                         Use parallel=auto for auto-setting of N
   repeat=N              Run each test N number of times
@@ -6169,7 +6183,7 @@ Misc options
                         failures before stopping, set with the --retry-failure
                         option
   retry-failure=N       When using the --retry option to retry failed tests,
-                        stop when N failures have occured (default $opt_retry_failure)
+                        stop when N failures have occurred (default $opt_retry_failure)
   reorder               Reorder tests to get fewer server restarts
   help                  Get this help text
 
@@ -6193,7 +6207,7 @@ Misc options
                         actions. Disable facility with NUM=0.
   gcov                  Collect coverage information after the test.
                         The result is a gcov file per source and header file.
-  gcov-src-dir=subdir   Colllect coverage only within the given subdirectory.
+  gcov-src-dir=subdir   Collect coverage only within the given subdirectory.
                         For example, if you're only developing the SQL layer, 
                         it makes sense to use --gcov-src-dir=sql
   gprof                 Collect profiling information using gprof.
@@ -6204,9 +6218,6 @@ Misc options
   timediff              With --timestamp, also print time passed since
                         *previous* test started
   max-connections=N     Max number of open connection to server in mysqltest
-  default-myisam        Set default storage engine to MyISAM for non-innodb
-                        tests. This is needed after switching default storage
-                        engine to InnoDB.
   report-times          Report how much time has been spent on different
                         phases of test execution.
   stress=ARGS           Run stress test, providing options to
