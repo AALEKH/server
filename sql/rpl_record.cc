@@ -185,7 +185,7 @@ pack_row(TABLE *table, MY_BITMAP const* cols,
 
    @retval HA_ERR_GENERIC
    A generic, internal, error caused the unpacking to fail.
-   @retval ER_SLAVE_CORRUPT_EVENT
+   @retval HA_ERR_CORRUPT_EVENT
    Found error when trying to unpack fields.
  */
 #if !defined(MYSQL_CLIENT) && defined(HAVE_REPLICATION)
@@ -200,7 +200,6 @@ unpack_row(rpl_group_info *rgi,
   DBUG_ASSERT(row_data);
   DBUG_ASSERT(table);
   size_t const master_null_byte_count= (bitmap_bits_set(cols) + 7) / 8;
-  int error= 0;
 
   uchar const *null_ptr= row_data;
   uchar const *pack_ptr= row_data + master_null_byte_count;
@@ -209,6 +208,16 @@ unpack_row(rpl_group_info *rgi,
   Field **field_ptr;
   Field **const end_ptr= begin_ptr + colcnt;
 
+  if (bitmap_is_clear_all(cols))
+  {
+    /**
+       There was no data sent from the master, so there is
+       nothing to unpack.
+     */
+    *current_row_end= pack_ptr;
+    *master_reclength= 0;
+    DBUG_RETURN(0);
+  }
   DBUG_ASSERT(null_ptr < row_data + master_null_byte_count);
 
   // Mask to mask out the correct bit among the null bits
@@ -290,9 +299,12 @@ unpack_row(rpl_group_info *rgi,
         }
         else
         {
+          THD *thd= f->table->in_use;
+
           f->set_default();
-          push_warning_printf(current_thd, Sql_condition::WARN_LEVEL_WARN,
-                              ER_BAD_NULL_ERROR, ER(ER_BAD_NULL_ERROR),
+          push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
+                              ER_BAD_NULL_ERROR,
+                              ER_THD(thd, ER_BAD_NULL_ERROR),
                               f->field_name);
         }
       }
@@ -337,7 +349,7 @@ unpack_row(rpl_group_info *rgi,
                       "Could not read field '%s' of table '%s.%s'",
                       f->field_name, table->s->db.str,
                       table->s->table_name.str);
-          DBUG_RETURN(ER_SLAVE_CORRUPT_EVENT);
+          DBUG_RETURN(HA_ERR_CORRUPT_EVENT);
         }
       }
 
@@ -421,7 +433,7 @@ unpack_row(rpl_group_info *rgi,
       *master_reclength = table->s->reclength;
   }
   
-  DBUG_RETURN(error);
+  DBUG_RETURN(0);
 }
 
 /**
@@ -465,11 +477,12 @@ int prepare_record(TABLE *const table, const uint skip, const bool check)
     if ((f->flags &  NO_DEFAULT_VALUE_FLAG) &&
         (f->real_type() != MYSQL_TYPE_ENUM))
     {
+      THD *thd= f->table->in_use;
       f->set_default();
-      push_warning_printf(current_thd,
+      push_warning_printf(thd,
                           Sql_condition::WARN_LEVEL_WARN,
                           ER_NO_DEFAULT_FOR_FIELD,
-                          ER(ER_NO_DEFAULT_FOR_FIELD),
+                          ER_THD(thd, ER_NO_DEFAULT_FOR_FIELD),
                           f->field_name);
     }
   }

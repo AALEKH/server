@@ -1,6 +1,6 @@
 /***********************************************************************
 
-Copyright (c) 1995, 2013, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2015, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2009, Percona Inc.
 Copyright (c) 2013, 2015, MariaDB Corporation.
 
@@ -133,6 +133,10 @@ enum os_file_create_t {
 #define OS_FILE_READ_ONLY		333
 #define	OS_FILE_READ_WRITE		444
 #define	OS_FILE_READ_ALLOW_DELETE	555	/* for mysqlbackup */
+#define OS_FILE_READ_WRITE_CACHED	666	/* OS_FILE_READ_WRITE but never
+						O_DIRECT. Only for
+						os_file_create_simple_no_error_handling
+						currently. */
 
 /* Options for file_create */
 #define	OS_FILE_AIO			61
@@ -321,11 +325,11 @@ The wrapper functions have the prefix of "innodb_". */
 # define os_file_close(file)						\
 	pfs_os_file_close_func(file, __FILE__, __LINE__)
 
-# define os_aio(type, mode, name, file, buf, offset,			\
-	n, message1, message2, space_id, 				\
+# define os_aio(type, is_log, mode, name, file, buf, offset,		\
+	n, page_size, message1, message2, space_id,			\
 	trx, write_size) 					 	\
-	pfs_os_aio_func(type, mode, name, file, buf, offset,		\
-		n, message1, message2, space_id, trx, write_size,	\
+	pfs_os_aio_func(type, is_log, mode, name, file, buf, offset,	\
+		n, page_size, message1, message2, space_id, trx, write_size, \
 		__FILE__, __LINE__)
 
 # define os_file_read(file, buf, offset, n)				\
@@ -372,10 +376,10 @@ to original un-instrumented file I/O APIs */
 
 # define os_file_close(file)	os_file_close_func(file)
 
-# define os_aio(type, mode, name, file, buf, offset, n, message1,	\
+# define os_aio(type, is_log, mode, name, file, buf, offset, n, page_size, message1, \
 	message2, space_id, trx, write_size)				\
-	os_aio_func(type, mode, name, file, buf, offset, n,		\
-		message1, message2, space_id, trx, write_size)
+	os_aio_func(type, is_log, mode, name, file, buf, offset, n,	\
+		page_size, message1, message2, space_id, trx, write_size)
 
 # define os_file_read(file, buf, offset, n)				\
 	os_file_read_func(file, buf, offset, n, NULL)
@@ -405,10 +409,10 @@ to original un-instrumented file I/O APIs */
 
 enum os_file_type_t {
 	OS_FILE_TYPE_UNKNOWN = 0,
-	OS_FILE_TYPE_FILE,			/* regular file */
+	OS_FILE_TYPE_FILE,			/* regular file
+						(or a character/block device) */
 	OS_FILE_TYPE_DIR,			/* directory */
-	OS_FILE_TYPE_LINK,			/* symbolic link */
-	OS_FILE_TYPE_BLOCK			/* block device */
+	OS_FILE_TYPE_LINK			/* symbolic link */
 };
 
 /* Maximum path string length in bytes when referring to tables with in the
@@ -544,9 +548,11 @@ os_file_create_simple_no_error_handling_func(
 				null-terminated string */
 	ulint		create_mode,/*!< in: create mode */
 	ulint		access_type,/*!< in: OS_FILE_READ_ONLY,
-				OS_FILE_READ_WRITE, or
-				OS_FILE_READ_ALLOW_DELETE; the last option is
-				used by a backup program reading the file */
+				OS_FILE_READ_WRITE,
+				OS_FILE_READ_ALLOW_DELETE (used by a backup
+				program reading the file), or
+				OS_FILE_READ_WRITE_CACHED (disable O_DIRECT
+				if it would be enabled otherwise) */
 	ibool*		success,/*!< out: TRUE if succeed, FALSE if error */
 	ulint		atomic_writes)/*!< in: atomic writes table option
 				      value */
@@ -557,7 +563,7 @@ UNIV_INTERN
 void
 os_file_set_nocache(
 /*================*/
-	int		fd,		/*!< in: file descriptor to alter */
+	os_file_t	fd,		/*!< in: file descriptor to alter */
 	const char*	file_name,	/*!< in: file name, used in the
 					diagnostic message */
 	const char*	operation_name);/*!< in: "open" or "create"; used in the
@@ -772,6 +778,7 @@ ibool
 pfs_os_aio_func(
 /*============*/
 	ulint		type,	/*!< in: OS_FILE_READ or OS_FILE_WRITE */
+	ulint		is_log,	/*!< in: 1 is OS_FILE_LOG or 0 */
 	ulint		mode,	/*!< in: OS_AIO_NORMAL etc. I/O mode */
 	const char*	name,	/*!< in: name of the file or path as a
 				null-terminated string */
@@ -780,6 +787,7 @@ pfs_os_aio_func(
 				to write */
 	os_offset_t	offset,	/*!< in: file offset where to read or write */
 	ulint		n,	/*!< in: number of bytes to read or write */
+	ulint		page_size,/*!< in: page size in bytes */
 	fil_node_t*	message1,/*!< in: message for the aio handler
 				(can be used to identify a completed
 				aio operation); ignored if mode is
@@ -1139,6 +1147,7 @@ ibool
 os_aio_func(
 /*========*/
 	ulint		type,	/*!< in: OS_FILE_READ or OS_FILE_WRITE */
+	ulint		is_log,	/*!< in: 1 is OS_FILE_LOG or 0 */
 	ulint		mode,	/*!< in: OS_AIO_NORMAL, ..., possibly ORed
 				to OS_AIO_SIMULATED_WAKE_LATER: the
 				last flag advises this function not to wake
@@ -1159,6 +1168,7 @@ os_aio_func(
 				to write */
 	os_offset_t	offset,	/*!< in: file offset where to read or write */
 	ulint		n,	/*!< in: number of bytes to read or write */
+	ulint		page_size, /*!< in: page size in bytes */
 	fil_node_t*	message1,/*!< in: message for the aio handler
 				(can be used to identify a completed
 				aio operation); ignored if mode is

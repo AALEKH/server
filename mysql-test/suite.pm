@@ -58,13 +58,13 @@ sub skip_combinations {
     return 0 unless socket my $sock, PF_INET6, SOCK_STREAM, getprotobyname('tcp');
     # eval{}, if there's no Socket::sockaddr_in6 at all, old Perl installation
     eval { connect $sock, sockaddr_in6(7, Socket::IN6ADDR_LOOPBACK) };
-    return $! != 101;
+    return $@ eq "";
   }
   $skip{'include/check_ipv6.inc'} = 'No IPv6' unless ipv6_ok();
 
   $skip{'t/openssl_6975.test'} = 'no or too old openssl'
     unless $::mysqld_variables{'version-ssl-library'} =~ /OpenSSL (\S+)/
-       and $1 ge "1.0.1";
+       and $1 ge "1.0.1d";
 
   %skip;
 }

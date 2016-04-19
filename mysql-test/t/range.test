@@ -1678,6 +1678,18 @@ select count(*) from t1 ignore index (ix_fd) where fd <'😁';
 drop table t1;
 set names default;
 
+#
+# Bug#17755540 VALGRIND ERROR WHEN SETTING UP ROW COMPARATORS
+#
+create table t2 (a int, b int, c int, d int, key x(a, b));
+insert into t2 values (2, 2, 2, 2), (3, 3, 3, 3), (4, 4, 4, 4), (5, 5, 5, 5),
+  (6, 6, 6, 6), (7, 7, 7, 7), (8, 8, 8, 8), (9, 9, 9, 9);
+insert into t2 select * from t2;
+insert into t2 values (0, 0, 0, 0), (1, 1, 1, 1);
+analyze table t2;
+select a, b from t2 where (a, b) in ((0, 0), (1, 1));
+drop table t2;
+
 --echo #
 --echo # BUG#13731380: RANGE OPTIMIZER CALLS RECORDS_IN_RANGE() FOR OPEN RANGE
 --echo #
@@ -1777,3 +1789,33 @@ explain extended select * from t2 where (b > 25 and b < 15) or c < 44;
 explain extended select * from t2 where (b > 25 and b < 15) or (a>55 and a<44);
 
 drop table t1,t2;
+
+
+--echo #
+--echo # Start of 10.1 tests
+--echo #
+
+--echo #
+--echo # MDEV-8189 field<>const and const<>field are not symmetric
+--echo #
+CREATE TABLE t1 (a INT, b INT, KEY(a));
+INSERT INTO t1 (a) VALUES (10),(10),(10),(10),(10),(10),(10),(10),(10),(10),(70);
+EXPLAIN SELECT * FROM t1 WHERE a<>10;
+EXPLAIN SELECT * FROM t1 WHERE 10<>a;
+SELECT * FROM t1 WHERE a<>10;
+SELECT * FROM t1 WHERE 10<>a;
+DROP TABLE t1;
+
+
+--echo #
+--echo # MDEV-8613 Full table scan for WHERE indexed_varchar_column <=> 'bad-character'
+--echo #
+SET NAMES utf8;
+CREATE TABLE t1 (a VARCHAR(10) CHARACTER SET utf8, KEY(a)) ENGINE=MyISAM;
+INSERT INTO t1 VALUES ('a'),('b'),('c'),('d'),('e');
+EXPLAIN SELECT * FROM t1 WHERE a<=>'😎';
+DROP TABLE t1;
+
+--echo #
+--echo # End of 10.1 tests
+--echo #

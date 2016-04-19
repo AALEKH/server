@@ -2578,7 +2578,6 @@ find_place(DYN_HEADER *hdr, void *key, my_bool string_keys)
   mid= 1;
   while (start != end)
   {
-    uint val;
     mid= (start + end) / 2;
     hdr->entry= hdr->header + mid * hdr->entry_size;
     if (!string_keys)
@@ -3723,10 +3722,13 @@ mariadb_dyncol_check(DYNAMIC_COLUMN *str)
     if (prev_type != DYN_COL_NULL)
     {
       /* It is not first entry */
-      if (prev_data_offset >= data_offset)
+      if (prev_data_offset > data_offset ||
+          ((prev_type !=  DYN_COL_INT &&
+            prev_type != DYN_COL_UINT &&
+            prev_type != DYN_COL_DECIMAL) && prev_data_offset == data_offset))
       {
         DBUG_PRINT("info", ("Field order: %u  Previous data offset: %u"
-                            " >= Current data offset: %u",
+                            " >(=) Current data offset: %u",
                             (uint)i,
                             (uint)prev_data_offset,
                             (uint)data_offset));
@@ -3835,14 +3837,12 @@ mariadb_dyncol_val_str(DYNAMIC_STRING *str, DYNAMIC_COLUMN_VALUE *val,
         return ER_DYNCOL_RESOURCE;
       break;
     case DYN_COL_DOUBLE:
-      len= my_snprintf(buff, sizeof(buff), "%g", val->x.double_value);
+
+      len= my_gcvt(val->x.double_value, MY_GCVT_ARG_DOUBLE,
+                   sizeof(buff) - 1, buff, NULL);
       if (dynstr_realloc(str, len + (quote ? 2 : 0)))
         return ER_DYNCOL_RESOURCE;
-      if (quote)
-        str->str[str->length++]= quote;
       dynstr_append_mem(str, buff, len);
-      if (quote)
-        str->str[str->length++]= quote;
       break;
     case DYN_COL_DYNCOL:
     case DYN_COL_STRING:
@@ -3894,11 +3894,11 @@ mariadb_dyncol_val_str(DYNAMIC_STRING *str, DYNAMIC_COLUMN_VALUE *val,
       }
     case DYN_COL_DECIMAL:
       {
-        int len= sizeof(buff);
-        decimal2string(&val->x.decimal.value, buff, &len,
+        int tmp_len= sizeof(buff);
+        decimal2string(&val->x.decimal.value, buff, &tmp_len,
                        0, val->x.decimal.value.frac,
                        '0');
-        if (dynstr_append_mem(str, buff, len))
+        if (dynstr_append_mem(str, buff, tmp_len))
           return ER_DYNCOL_RESOURCE;
         break;
       }
@@ -4248,7 +4248,7 @@ mariadb_dyncol_unpack(DYNAMIC_COLUMN *str,
   {
     *names= my_malloc(sizeof(LEX_STRING) * header.column_count +
                       DYNCOL_NUM_CHAR * header.column_count, MYF(0));
-    nm= (char *)(names + sizeof(LEX_STRING) * header.column_count);
+    nm= (char *)((*names) + header.column_count);
   }
   else
   {

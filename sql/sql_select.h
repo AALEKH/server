@@ -2,7 +2,7 @@
 #define SQL_SELECT_INCLUDED
 
 /* Copyright (c) 2000, 2013, Oracle and/or its affiliates.
-   Copyright (c) 2008, 2013, Monty Program Ab.
+   Copyright (c) 2008, 2015, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -32,7 +32,6 @@
 #include "sql_array.h"                        /* Array */
 #include "records.h"                          /* READ_RECORD */
 #include "opt_range.h"                /* SQL_SELECT, QUICK_SELECT_I */
-
 
 /* Values in optimize */
 #define KEY_OPTIMIZE_EXISTS		1
@@ -745,8 +744,7 @@ public:
                                struct st_position *pos,
                                struct st_position *loose_scan_pos);
   friend bool get_best_combination(JOIN *join);
-  friend int setup_semijoin_dups_elimination(JOIN *join, ulonglong options,
-                                             uint no_jbuf_after);
+  friend int setup_semijoin_loosescan(JOIN *join);
   friend void fix_semijoin_strategies_for_picked_join_order(JOIN *join);
 };
 
@@ -853,7 +851,12 @@ typedef struct st_position
   */
   uint n_sj_tables;
 
-  table_map prefix_dups_producing_tables;
+  /*
+    Bitmap of semi-join inner tables that are in the join prefix and for
+    which there's no provision for how to eliminate semi-join duplicates
+    they produce.
+  */
+  table_map dups_producing_tables;
 
   table_map inner_tables_handled_with_other_sjs;
    
@@ -880,6 +883,7 @@ public:
   JOIN_TAB *end;
 };
 
+class Pushdown_query;
 
 class JOIN :public Sql_alloc
 {
@@ -934,7 +938,7 @@ protected:
   enum enum_reopt_result {
     REOPT_NEW_PLAN, /* there is a new reoptimized plan */
     REOPT_OLD_PLAN, /* no new improved plan can be found, use the old one */
-    REOPT_ERROR,    /* an irrecovarable error occured during reoptimization */
+    REOPT_ERROR,    /* an irrecovarable error occurred during reoptimization */
     REOPT_NONE      /* not yet reoptimized */
   };
 
@@ -957,6 +961,9 @@ public:
   uint pre_sort_index;
   Item *pre_sort_idx_pushed_cond;
   void clean_pre_sort_join_tab();
+
+  /* List of fields that aren't under an aggregate function */
+  List<Item_field> non_agg_fields;
 
   /*
     For "Using temporary+Using filesort" queries, JOIN::join_tab can point to
@@ -1005,6 +1012,12 @@ public:
   uint     top_join_tab_count;
   uint	   send_group_parts;
   /*
+    This counts how many times do_select() was invoked for this JOIN.
+    It's used to restrict Pushdown_query::execute() only to the first
+    do_select() invocation.
+  */
+  uint     do_select_call_count;
+  /*
     True if the query has GROUP BY.
     (that is, if group_by != NULL. when DISTINCT is converted into GROUP BY, it
      will set this, too. It is not clear why we need a separate var from 
@@ -1044,7 +1057,7 @@ public:
   table_map outer_join;
   /* Bitmap of tables used in the select list items */
   table_map select_list_used_tables;
-  ha_rows  send_records,found_records,examined_rows;
+  ha_rows  send_records,found_records,join_examined_rows;
 
   /*
     LIMIT for the JOIN operation. When not using aggregation or DISITNCT, this 
@@ -1073,6 +1086,10 @@ public:
   /* Finally picked QEP. This is result of join optimization */
   POSITION *best_positions;
 
+  Pushdown_query *pushdown_query;
+  JOIN_TAB *original_join_tab;
+  uint	   original_table_count;
+
 /******* Join optimization state members start *******/
   /*
     pointer - we're doing optimization for a semi-join materialization nest.
@@ -1096,13 +1113,6 @@ public:
   */
   table_map cur_sj_inner_tables;
   
-  /*
-    Bitmap of semi-join inner tables that are in the join prefix and for
-    which there's no provision for how to eliminate semi-join duplicates
-    they produce.
-  */
-  table_map cur_dups_producing_tables;
-  
   /* We also maintain a stack of join optimization states in * join->positions[] */
 /******* Join optimization state members end *******/
 
@@ -1124,7 +1134,7 @@ public:
     reexecutions. This value is equal to the multiplication of all
     join->positions[i].records_read of a JOIN.
   */
-  double   record_count;
+  double   join_record_count;
   List<Item> *fields;
   List<Cached_item> group_fields, group_fields_cache;
   TABLE    *tmp_table;
@@ -1329,6 +1339,7 @@ public:
     table_count= 0;
     top_join_tab_count= 0;
     const_tables= 0;
+    const_table_map= 0;
     eliminated_tables= 0;
     join_list= 0;
     implicit_grouping= FALSE;
@@ -1338,7 +1349,7 @@ public:
     send_records= 0;
     found_records= 0;
     fetch_limit= HA_POS_ERROR;
-    examined_rows= 0;
+    join_examined_rows= 0;
     exec_tmp_table1= 0;
     exec_tmp_table2= 0;
     sortorder= 0;
@@ -1377,12 +1388,16 @@ public:
     group_optimized_away= 0;
     no_rows_in_result_called= 0;
     positions= best_positions= 0;
+    pushdown_query= 0;
+    original_join_tab= 0;
+    do_select_call_count= 0;
 
     explain= NULL;
 
     all_fields= fields_arg;
     if (&fields_list != &fields_arg)      /* Avoid valgrind-warning */
       fields_list= fields_arg;
+    non_agg_fields.empty();
     bzero((char*) &keyuse,sizeof(keyuse));
     tmp_table_param.init();
     tmp_table_param.end_write_records= HA_POS_ERROR;
@@ -1533,6 +1548,8 @@ public:
   int save_explain_data_intern(Explain_query *output, bool need_tmp_table,
                                bool need_order, bool distinct,
                                const char *message);
+  JOIN_TAB *first_breadth_first_optimization_tab() { return table_access_tabs; }
+  JOIN_TAB *first_breadth_first_execution_tab() { return join_tab; }
 private:
   /**
     TRUE if the query contains an aggregate function but has no GROUP
@@ -1573,8 +1590,8 @@ bool copy_funcs(Item **func_ptr, const THD *thd);
 uint find_shortest_key(TABLE *table, const key_map *usable_keys);
 Field* create_tmp_field_from_field(THD *thd, Field* org_field,
                                    const char *name, TABLE *table,
-                                   Item_field *item, uint convert_blob_length);
-                                                                      
+                                   Item_field *item);
+
 bool is_indexed_agg_distinct(JOIN *join, List<Item_field> *out_args);
 
 /* functions from opt_sum.cc */
@@ -1832,8 +1849,7 @@ Field *create_tmp_field(THD *thd, TABLE *table,Item *item, Item::Type type,
                         Field **def_field,
 			bool group, bool modify_item,
 			bool table_cant_handle_bit_fields,
-                        bool make_copy_field,
-                        uint convert_blob_length);
+                        bool make_copy_field);
 
 /*
   General routine to change field->ptr of a NULL-terminated array of Field
@@ -1849,9 +1865,9 @@ int test_if_item_cache_changed(List<Cached_item> &list);
 int join_init_read_record(JOIN_TAB *tab);
 int join_read_record_no_init(JOIN_TAB *tab);
 void set_position(JOIN *join,uint idx,JOIN_TAB *table,KEYUSE *key);
-inline Item * and_items(Item* cond, Item *item)
+inline Item * and_items(THD *thd, Item* cond, Item *item)
 {
-  return (cond? (new Item_cond_and(cond, item)) : item);
+  return (cond ? (new (thd->mem_root) Item_cond_and(thd, cond, item)) : item);
 }
 bool choose_plan(JOIN *join, table_map join_tables);
 void optimize_wo_join_buffering(JOIN *join, uint first_tab, uint last_tab, 
@@ -1944,5 +1960,22 @@ ulong check_selectivity(THD *thd,
                         TABLE *table,
                         List<COND_STATISTIC> *conds);
 
+class Pushdown_query: public Sql_alloc
+{
+public:
+  SELECT_LEX *select_lex;
+  bool store_data_in_temp_table;
+  group_by_handler *handler;
+  Item *having;
+
+  Pushdown_query(SELECT_LEX *select_lex_arg, group_by_handler *handler_arg)
+    : select_lex(select_lex_arg), store_data_in_temp_table(0),
+    handler(handler_arg), having(0) {}
+
+  ~Pushdown_query() { delete handler; }
+
+  /* Function that calls the above scan functions */
+  int execute(JOIN *join);
+};
 
 #endif /* SQL_SELECT_INCLUDED */

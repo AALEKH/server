@@ -5571,8 +5571,8 @@ ER_SP_WRONG_NAME 42000
         eng "Incorrect routine name '%-.192s'"
         ger "Ungültiger Routinenname '%-.192s'"
 ER_TABLE_NEEDS_UPGRADE
-        eng "Table upgrade required. Please do \"REPAIR TABLE `%-.32s`\" or dump/reload to fix it!"
-        ger "Tabellenaktualisierung erforderlich. Bitte zum Reparieren \"REPAIR TABLE `%-.32s`\" eingeben!"
+        eng "Upgrade required. Please do \"REPAIR %s %`s\" or dump/reload to fix it!"
+        ger "Aktualisierung erforderlich. Bitte zum Reparieren \"REPAIR %s %`s\" eingeben!"
 ER_SP_NO_AGGREGATE 42000
         eng "AGGREGATE is not supported for stored functions"
         ger "AGGREGATE wird bei gespeicherten Funktionen nicht unterstützt"
@@ -6034,7 +6034,7 @@ ER_EVENT_CANNOT_ALTER_IN_THE_PAST
   eng "Event execution time is in the past and ON COMPLETION NOT PRESERVE is set. The event was not changed. Specify a time in the future."
   ger "Execution Zeitpunkt des Ereignisses in der Vergangenheit liegt, und es war NACH ABSCHLUSS Set nicht erhalten. Die Veranstaltung wurde nicht verändert. Geben Sie einen Zeitpunkt in der Zukunft."
 ER_SLAVE_INCIDENT
-  eng "The incident %s occured on the master. Message: %-.64s"
+  eng "The incident %s occurred on the master. Message: %-.64s"
   ger "Der Vorfall %s passierte auf dem Master. Meldung: %-.64s"
 ER_NO_PARTITION_FOR_GIVEN_VALUE_SILENT
   eng "Table has no partition for some existing values"
@@ -7106,9 +7106,12 @@ ER_PRIOR_COMMIT_FAILED
 ER_IT_IS_A_VIEW 42S02
         eng "'%-.192s' is a view"
 ER_SLAVE_SKIP_NOT_IN_GTID
-	eng "When using GTID, @@sql_slave_skip_counter can not be used. Instead, setting @@gtid_slave_pos explicitly can be used to skip to after a given GTID position."
+	eng "When using parallel replication and GTID with multiple replication domains, @@sql_slave_skip_counter can not be used. Instead, setting @@gtid_slave_pos explicitly can be used to skip to after a given GTID position."
 ER_TABLE_DEFINITION_TOO_BIG
         eng "The definition for table %`s is too big"
+ER_PLUGIN_INSTALLED
+        eng "Plugin '%-.192s' already installed"
+        rus "Плагин '%-.192s' уже установлен"
 ER_STATEMENT_TIMEOUT 70100
         eng "Query execution was interrupted (max_statement_time exceeded)"
 ER_SUBQUERIES_NOT_SUPPORTED 42000
@@ -7127,3 +7130,12 @@ ER_ROLE_DROP_EXISTS
         eng "Can't drop role '%-.64s'; it doesn't exist"
 ER_CANNOT_CONVERT_CHARACTER
         eng "Cannot convert '%s' character 0x%-.64s to '%s'"
+ER_INVALID_DEFAULT_VALUE_FOR_FIELD  22007
+        eng "Incorrect default value '%-.128s' for column '%.192s'"
+ER_KILL_QUERY_DENIED_ERROR
+        eng "You are not owner of query %lu"
+        ger "Sie sind nicht Eigentümer von Abfrage %lu"
+        rus "Вы не являетесь владельцем запроса %lu"
+ER_NO_EIS_FOR_FIELD
+        eng "Engine-independent statistics are not collected for column '%s'"
+        ukr "Незалежна від типу таблиці статистика не збирається для стовбця '%s'"

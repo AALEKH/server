@@ -1,5 +1,6 @@
-/* Copyright (c) 2000, 2013, Oracle and/or its affiliates.
-   Copyright (c) 2009, 2013, Monty Program Ab.
+/*
+   Copyright (c) 2000, 2015, Oracle and/or its affiliates.
+   Copyright (c) 2009, 2016, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -20,24 +21,24 @@
 /* Classes in mysql */
 
 #include "my_global.h"                          /* NO_EMBEDDED_ACCESS_CHECKS */
-#ifdef MYSQL_SERVER
-#include "unireg.h"                    // REQUIRED: for other includes
-#endif
 #include <waiting_threads.h>
 #include "sql_const.h"
 #include <mysql/plugin_audit.h>
 #include "log.h"
 #include "rpl_tblmap.h"
 #include "mdl.h"
+#include "field.h"                              // Create_field
 #include "probes_mysql.h"
-#include "sql_locale.h"                         /* my_locale_st */
-#include "sql_profile.h"                   /* PROFILING */
-#include "scheduler.h"                     /* thd_scheduler */
-#include "protocol.h"             /* Protocol_text, Protocol_binary */
-#include "violite.h"              /* vio_is_connected */
-#include "thr_lock.h"             /* thr_lock_type, THR_LOCK_DATA,
-                                     THR_LOCK_INFO */
+#include "sql_locale.h"     /* my_locale_st */
+#include "sql_profile.h"    /* PROFILING */
+#include "scheduler.h"      /* thd_scheduler */
+#include "protocol.h"       /* Protocol_text, Protocol_binary */
+#include "violite.h"        /* vio_is_connected */
+#include "thr_lock.h"       /* thr_lock_type, THR_LOCK_DATA, THR_LOCK_INFO */
 #include "thr_timer.h"
+
+#include "sql_digest_stream.h"            // sql_digest_state
+
 #include <mysql/psi/mysql_stage.h>
 #include <mysql/psi/mysql_statement.h>
 #include <mysql/psi/mysql_idle.h>
@@ -63,10 +64,8 @@ class Reprepare_observer;
 class Relay_log_info;
 struct rpl_group_info;
 class Rpl_filter;
-
 class Query_log_event;
 class Load_log_event;
-class Slave_log_event;
 class sp_rcontext;
 class sp_cache;
 class Lex_input_stream;
@@ -74,6 +73,7 @@ class Parser_state;
 class Rows_log_event;
 class Sroutine_hash_entry;
 class user_var_entry;
+struct Trans_binlog_info;
 class rpl_io_thread_info;
 class rpl_sql_thread_info;
 
@@ -92,6 +92,16 @@ enum enum_slave_type_conversions { SLAVE_TYPE_CONVERSIONS_ALL_LOSSY,
 enum enum_mark_columns
 { MARK_COLUMNS_NONE, MARK_COLUMNS_READ, MARK_COLUMNS_WRITE};
 enum enum_filetype { FILETYPE_CSV, FILETYPE_XML };
+
+enum enum_binlog_row_image {
+  /** PKE in the before image and changed columns in the after image */
+  BINLOG_ROW_IMAGE_MINIMAL= 0,
+  /** Whenever possible, before and after image contain all columns except blobs. */
+  BINLOG_ROW_IMAGE_NOBLOB= 1,
+  /** All columns in both before and after image. */
+  BINLOG_ROW_IMAGE_FULL= 2
+};
+
 
 /* Bits for different SQL modes modes (including ANSI mode) */
 #define MODE_REAL_AS_FLOAT              (1ULL << 0)
@@ -484,7 +494,6 @@ enum killed_type
 
 #include "sql_lex.h"				/* Must be here */
 
-extern LEX_STRING sql_statement_names[(uint) SQLCOM_END + 1];
 class Delayed_insert;
 class select_result;
 class Time_zone;
@@ -586,6 +595,7 @@ typedef struct system_variables
   /* Flags for slow log filtering */
   ulong log_slow_rate_limit; 
   ulong binlog_format; ///< binlog format for this thd (see enum_binlog_format)
+  ulong binlog_row_image;
   ulong progress_report_time;
   ulong completion_type;
   ulong query_cache_type;
@@ -620,6 +630,11 @@ typedef struct system_variables
   my_bool query_cache_strip_comments;
   my_bool sql_log_slow;
   my_bool sql_log_bin;
+  /*
+    A flag to help detect whether binary logging was temporarily disabled
+    (see tmp_disable_binlog(A) macro).
+  */
+  my_bool sql_log_bin_off;
   my_bool binlog_annotate_row_events;
   my_bool binlog_direct_non_trans_update;
 
@@ -642,6 +657,8 @@ typedef struct system_variables
 
   /* Error messages */
   MY_LOCALE *lc_messages;
+  const char **errmsgs;             /* lc_messages->errmsg->errmsgs */
+
   /* Locale Support */
   MY_LOCALE *lc_time_names;
 
@@ -658,6 +675,7 @@ typedef struct system_variables
   my_bool wsrep_dirty_reads;
   uint wsrep_sync_wait;
   ulong wsrep_retry_autocommit;
+  ulong wsrep_OSU_method;
   double long_query_time_double, max_statement_time_double;
 
   my_bool pseudo_slave_mode;
@@ -672,8 +690,20 @@ typedef struct system_variables
 
 typedef struct system_status_var
 {
-  ulong com_other;
   ulong com_stat[(uint) SQLCOM_END];
+  ulong com_create_tmp_table;
+  ulong com_drop_tmp_table;
+  ulong com_other;
+
+  ulong com_stmt_prepare;
+  ulong com_stmt_reprepare;
+  ulong com_stmt_execute;
+  ulong com_stmt_send_long_data;
+  ulong com_stmt_fetch;
+  ulong com_stmt_reset;
+  ulong com_stmt_close;
+
+  ulong com_register_slave;
   ulong created_tmp_disk_tables_;
   ulong created_tmp_tables_;
   ulong ha_commit_count;
@@ -726,14 +756,6 @@ typedef struct system_status_var
   ulong filesort_rows_;
   ulong filesort_scan_count_;
   ulong filesort_pq_sorts_;
-  /* Prepared statements and binary protocol */
-  ulong com_stmt_prepare;
-  ulong com_stmt_reprepare;
-  ulong com_stmt_execute;
-  ulong com_stmt_send_long_data;
-  ulong com_stmt_fetch;
-  ulong com_stmt_reset;
-  ulong com_stmt_close;
 
   /* Features used */
   ulong feature_dynamic_columns;    /* +1 when creating a dynamic column */
@@ -799,9 +821,6 @@ void add_to_status(STATUS_VAR *to_var, STATUS_VAR *from_var);
 
 void add_diff_to_status(STATUS_VAR *to_var, STATUS_VAR *from_var,
                         STATUS_VAR *dec_var);
-
-void mark_transaction_to_rollback(THD *thd, bool all);
-
 
 /**
   Get collation by name, send error to client on failure.
@@ -1784,7 +1803,7 @@ struct wait_for_commit
       return wakeup_error;
     }
   }
-  void wakeup_subsequent_commits(int wakeup_error)
+  void wakeup_subsequent_commits(int wakeup_error_arg)
   {
     /*
       Do the check inline, so only the wakeup case takes the cost of a function
@@ -1799,7 +1818,7 @@ struct wait_for_commit
       prevent a waiter from arriving just after releasing the lock.
     */
     if (subsequent_commits_list)
-      wakeup_subsequent_commits2(wakeup_error);
+      wakeup_subsequent_commits2(wakeup_error_arg);
   }
   void unregister_wait_for_prior_commit()
   {
@@ -2022,6 +2041,9 @@ public:
   */
   const char *where;
 
+  /* Needed by MariaDB semi sync replication */
+  Trans_binlog_info *semisync_info;
+
   ulong client_capabilities;		/* What the client supports */
   ulong max_client_packet_length;
 
@@ -2090,10 +2112,10 @@ public:
   /* Do not set socket timeouts for wait_timeout (used with threadpool) */
   bool skip_wait_timeout;
 
-  /* container for handler's private per-connection data */
-  Ha_data ha_data[MAX_HA];
-
   bool prepare_derived_at_open;
+
+  /* Set to 1 if status of this THD is already in global status */
+  bool status_in_global;
 
   /* 
     To signal that the tmp table to be created is created for materialized
@@ -2102,6 +2124,9 @@ public:
   bool create_tmp_table_for_derived;
 
   bool save_prep_leaf_list;
+
+  /* container for handler's private per-connection data */
+  Ha_data ha_data[MAX_HA];
 
 #ifndef MYSQL_CLIENT
   binlog_cache_mngr *  binlog_setup_trx_data();
@@ -2114,14 +2139,12 @@ public:
   int binlog_write_table_map(TABLE *table, bool is_transactional,
                              my_bool *with_annotate= 0);
   int binlog_write_row(TABLE* table, bool is_transactional,
-                       MY_BITMAP const* cols, size_t colcnt,
                        const uchar *buf);
   int binlog_delete_row(TABLE* table, bool is_transactional,
-                        MY_BITMAP const* cols, size_t colcnt,
                         const uchar *buf);
   int binlog_update_row(TABLE* table, bool is_transactional,
-                        MY_BITMAP const* cols, size_t colcnt,
                         const uchar *old_data, const uchar *new_data);
+  static void binlog_prepare_row_images(TABLE* table);
 
   void set_server_id(uint32 sid) { variables.server_id = sid; }
 
@@ -2130,11 +2153,9 @@ public:
   */
   template <class RowsEventT> Rows_log_event*
     binlog_prepare_pending_rows_event(TABLE* table, uint32 serv_id,
-                                      MY_BITMAP const* cols,
-                                      size_t colcnt,
                                       size_t needed,
                                       bool is_transactional,
-				      RowsEventT* hint);
+                                      RowsEventT* hint);
   Rows_log_event* binlog_get_pending_rows_event(bool is_transactional) const;
   void binlog_set_pending_rows_event(Rows_log_event* ev, bool is_transactional);
   inline int binlog_flush_pending_rows_event(bool stmt_end)
@@ -2156,7 +2177,7 @@ public:
   int is_current_stmt_binlog_format_row() const {
     DBUG_ASSERT(current_stmt_binlog_format == BINLOG_FORMAT_STMT ||
                 current_stmt_binlog_format == BINLOG_FORMAT_ROW);
-    return WSREP_FORMAT(current_stmt_binlog_format) == BINLOG_FORMAT_ROW;
+    return current_stmt_binlog_format == BINLOG_FORMAT_ROW;
   }
 
   enum binlog_filter_state
@@ -2570,6 +2591,13 @@ public:
   PROFILING  profiling;
 #endif
 
+  /** Current statement digest. */
+  sql_digest_state *m_digest;
+  /** Current statement digest token array. */
+  unsigned char *m_token_array;
+  /** Top level statement digest. */
+  sql_digest_state m_digest_state;
+
   /** Current statement instrumentation. */
   PSI_statement_locker *m_statement_psi;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
@@ -2601,6 +2629,7 @@ public:
   ulong      query_plan_fsort_passes; 
   pthread_t  real_id;                           /* For debugging */
   my_thread_id  thread_id;
+  uint32      os_thread_id;
   uint	     tmp_table, global_disable_checkpoint;
   uint	     server_status,open_options;
   enum enum_thread_type system_thread;
@@ -3226,6 +3255,8 @@ public:
     if (get_stmt_da()->is_error())
       get_stmt_da()->reset_diagnostics_area();
     is_slave_error= 0;
+    if (killed == KILL_BAD_DATA)
+      killed= NOT_KILLED; // KILL_BAD_DATA can be reset w/o a mutex
     DBUG_VOID_RETURN;
   }
 #ifndef EMBEDDED_LIBRARY
@@ -3366,7 +3397,7 @@ public:
   {
     int err= killed_errno();
     if (err)
-      my_message(err, ER(err), MYF(0));
+      my_message(err, ER_THD(this, err), MYF(0));
   }
   /* return TRUE if we will abort query if we make a warning now */
   inline bool really_abort_on_warning()
@@ -3678,7 +3709,13 @@ private:
 public:
   /** Overloaded to guard query/query_length fields */
   virtual void set_statement(Statement *stmt);
-  void set_command(enum enum_server_command command);
+  void set_command(enum enum_server_command command)
+  {
+    m_command= command;
+#ifdef HAVE_PSI_THREAD_INTERFACE
+    PSI_STATEMENT_CALL(set_thread_command)(m_command);
+#endif
+  }
   inline enum enum_server_command get_command() const
   { return m_command; }
 
@@ -3695,7 +3732,16 @@ public:
   {
     set_query(CSET_STRING(query_arg, query_length_arg, charset()));
   }
-  void set_query(const CSET_STRING &str); /* Mutex protected */
+  void set_query(const CSET_STRING &string_arg)
+  {
+    mysql_mutex_lock(&LOCK_thd_data);
+    set_query_inner(string_arg);
+    mysql_mutex_unlock(&LOCK_thd_data);
+
+#ifdef HAVE_PSI_THREAD_INTERFACE
+    PSI_THREAD_CALL(set_thread_info)(query(), query_length());
+#endif
+  }
   void reset_query()               /* Mutex protected */
   { set_query(CSET_STRING()); }
   void set_query_and_id(char *query_arg, uint32 query_length_arg,
@@ -3792,6 +3838,8 @@ public:
   {
     mysql_mutex_lock(&LOCK_status);
     add_to_status(&global_status_var, &status_var);
+    /* Mark that this THD status has already been added in global status */
+    status_in_global= 1;
     mysql_mutex_unlock(&LOCK_status);
   }
 
@@ -3817,6 +3865,7 @@ public:
     wait_for_commit_ptr= suspended;
   }
 
+  void mark_transaction_to_rollback(bool all);
 private:
 
   /** The current internal error handler for this thread, or NULL. */
@@ -3941,6 +3990,13 @@ public:
 #endif /*  GTID_SUPPORT */
   void                      *wsrep_apply_format;
   char                      wsrep_info[128]; /* string for dynamic proc info */
+  /*
+    When enabled, do not replicate/binlog updates from the current table that's
+    being processed. At the moment, it is used to keep mysql.gtid_slave_pos
+    table updates from being replicated to other nodes via galera replication.
+  */
+  bool                      wsrep_ignore_table;
+  wsrep_gtid_t              wsrep_sync_wait_gtid;
 #endif /* WITH_WSREP */
 
   /* Handling of timeouts for commands */
@@ -3966,6 +4022,8 @@ public:
   void reset_query_timer()
   {
 #ifndef EMBEDDED_LIBRARY
+    if (spcont || in_sub_stmt || slave_thread)
+      return;
     if (!query_timer.expired)
       thr_timer_end(&query_timer);
 #endif
@@ -3997,11 +4055,14 @@ my_eof(THD *thd)
   thd->get_stmt_da()->set_eof_status(thd);
 }
 
-#define tmp_disable_binlog(A)       \
+#define tmp_disable_binlog(A)                                              \
   {ulonglong tmp_disable_binlog__save_options= (A)->variables.option_bits; \
-  (A)->variables.option_bits&= ~OPTION_BIN_LOG
+  (A)->variables.option_bits&= ~OPTION_BIN_LOG;                            \
+  (A)->variables.sql_log_bin_off= 1;
 
-#define reenable_binlog(A)   (A)->variables.option_bits= tmp_disable_binlog__save_options;}
+#define reenable_binlog(A)                                                  \
+  (A)->variables.option_bits= tmp_disable_binlog__save_options;             \
+  (A)->variables.sql_log_bin_off= 0;}
 
 
 inline sql_mode_t sql_mode_for_dates(THD *thd)
@@ -4041,6 +4102,8 @@ class JOIN;
 class select_result_sink: public Sql_alloc
 {
 public:
+  THD *thd;
+  select_result_sink(THD *thd_arg): thd(thd_arg) {}
   /*
     send_data returns 0 on ok, 1 on error and -1 if data was ignored, for
     example for a duplicate row entry written to a temp table.
@@ -4065,7 +4128,6 @@ public:
 class select_result :public select_result_sink 
 {
 protected:
-  THD *thd;
   /* 
     All descendant classes have their send_data() skip the first 
     unit->offset_limit_cnt rows sent.  Select_materialize
@@ -4074,7 +4136,7 @@ protected:
   SELECT_LEX_UNIT *unit;
   /* Something used only by the parser: */
 public:
-  select_result(THD *thd_arg): thd(thd_arg) {}
+  select_result(THD *thd_arg): select_result_sink(thd_arg) {}
   virtual ~select_result() {};
   /**
     Change wrapped select_result.
@@ -4161,9 +4223,8 @@ class select_result_explain_buffer : public select_result_sink
 {
 public:
   select_result_explain_buffer(THD *thd_arg, TABLE *table_arg) : 
-    thd(thd_arg), dst_table(table_arg) {};
+    select_result_sink(thd_arg), dst_table(table_arg) {};
 
-  THD *thd;
   TABLE *dst_table; /* table to write into */
 
   /* The following is called in the child thread: */
@@ -4180,7 +4241,7 @@ public:
 class select_result_text_buffer : public select_result_sink
 {
 public:
-  select_result_text_buffer(THD *thd_arg) : thd(thd_arg) {}
+  select_result_text_buffer(THD *thd_arg): select_result_sink(thd_arg) {}
   int send_data(List<Item> &items);
   bool send_result_set_metadata(List<Item> &fields, uint flag);
 
@@ -4188,7 +4249,6 @@ public:
 private:
   int append_row(List<Item> &items, bool send_names);
 
-  THD *thd;
   List<char*> rows;
   int n_columns;
 };
@@ -4345,6 +4405,8 @@ class select_insert :public select_result_interceptor {
   virtual int send_data(List<Item> &items);
   virtual void store_values(List<Item> &values);
   virtual bool can_rollback_data() { return 0; }
+  bool prepare_eof();
+  bool send_ok_packet();
   bool send_eof();
   virtual void abort_result_set();
   /* not implemented: select_insert is never re-used in prepared statements */
@@ -4404,10 +4466,14 @@ public:
 #define TMP_ENGINE_COLUMNDEF MARIA_COLUMNDEF
 #define TMP_ENGINE_HTON maria_hton
 #define TMP_ENGINE_NAME "Aria"
+inline uint tmp_table_max_key_length() { return maria_max_key_length(); }
+inline uint tmp_table_max_key_parts() { return maria_max_key_segments(); }
 #else
 #define TMP_ENGINE_COLUMNDEF MI_COLUMNDEF
 #define TMP_ENGINE_HTON myisam_hton
 #define TMP_ENGINE_NAME "MyISAM"
+inline uint tmp_table_max_key_length() { return MI_MAX_KEY_LENGTH; }
+inline uint tmp_table_max_key_parts() { return MI_MAX_KEY_SEG; }
 #endif
 
 /*
@@ -4463,8 +4529,6 @@ public:
   uint	group_parts,group_length,group_null_parts;
   uint	quick_group;
   bool  using_indirect_summary_function;
-  /* If >0 convert all blob fields to varchar(convert_blob_length) */
-  uint  convert_blob_length;
   CHARSET_INFO *table_charset;
   bool schema_table;
   /* TRUE if the temp table is created for subquery materialization. */
@@ -4493,7 +4557,7 @@ public:
 
   TMP_TABLE_PARAM()
     :copy_field(0), group_parts(0),
-     group_length(0), group_null_parts(0), convert_blob_length(0),
+     group_length(0), group_null_parts(0),
     schema_table(0), materialized_subquery(0), force_not_null_cols(0),
     precomputed_group_by(0),
     force_copy_fields(0), bit_fields_as_long(0), skip_create_table(0)
@@ -4588,9 +4652,10 @@ private:
 public:
   /* Number of rows in the union */
   ha_rows send_records; 
-  select_union_direct(THD *thd_arg, select_result *result,
-                      SELECT_LEX *last_select_lex):
-    select_union(thd_arg), result(result), last_select_lex(last_select_lex),
+  select_union_direct(THD *thd_arg, select_result *result_arg,
+                      SELECT_LEX *last_select_lex_arg):
+  select_union(thd_arg), result(result_arg),
+    last_select_lex(last_select_lex_arg),
     done_send_result_set_metadata(false), done_initialize_tables(false),
     limit_found_rows(0)
     { send_records= 0; }
@@ -4892,6 +4957,7 @@ public:
 // this is needed for user_vars hash
 class user_var_entry
 {
+  CHARSET_INFO *m_charset;
  public:
   user_var_entry() {}                         /* Remove gcc warning */
   LEX_STRING name;
@@ -4905,7 +4971,8 @@ class user_var_entry
   longlong val_int(bool *null_value) const;
   String *val_str(bool *null_value, String *str, uint decimals);
   my_decimal *val_decimal(bool *null_value, my_decimal *result);
-  DTCollation collation;
+  CHARSET_INFO *charset() const { return m_charset; }
+  void set_charset(CHARSET_INFO *cs) { m_charset= cs; }
 };
 
 user_var_entry *get_variable(HASH *hash, LEX_STRING &name,
@@ -5258,8 +5325,6 @@ public:
 */
 #define CF_SKIP_WSREP_CHECK     (1U << 2)
 
-void mark_transaction_to_rollback(THD *thd, bool all);
-
 /* Inline functions */
 
 inline bool add_item_to_list(THD *thd, Item *item)
@@ -5269,7 +5334,7 @@ inline bool add_item_to_list(THD *thd, Item *item)
 
 inline bool add_value_to_list(THD *thd, Item *value)
 {
-  return thd->lex->value_list.push_back(value);
+  return thd->lex->value_list.push_back(value, thd->mem_root);
 }
 
 inline bool add_order_to_list(THD *thd, Item *item, bool asc)
@@ -5285,6 +5350,13 @@ inline bool add_gorder_to_list(THD *thd, Item *item, bool asc)
 inline bool add_group_to_list(THD *thd, Item *item, bool asc)
 {
   return thd->lex->current_select->add_group_to_list(thd, item, asc);
+}
+
+inline Item *and_conds(THD *thd, Item *a, Item *b)
+{
+  if (!b) return a;
+  if (!a) return b;
+  return new (thd->mem_root) Item_cond_and(thd, a, b);
 }
 
 /* inline handler methods that need to know TABLE and THD structures */

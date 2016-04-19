@@ -1,5 +1,6 @@
 /*
    Copyright (c) 2000, 2010, Oracle and/or its affiliates.
+   Copyright (c) 2010, 2015, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -158,7 +159,7 @@ void Update_plan::save_explain_data_intern(MEM_ROOT *mem_root,
   explain->where_cond= select? select->cond: NULL;
 
   if (using_filesort)
-    explain->filesort_tracker= new (mem_root) Filesort_tracker;
+    explain->filesort_tracker= new (mem_root) Filesort_tracker(is_analyze);
   explain->using_io_buffer= using_io_buffer;
 
   append_possible_keys(mem_root, explain->possible_keys, table, 
@@ -311,7 +312,7 @@ bool mysql_delete(THD *thd, TABLE_LIST *table_list, COND *conds,
   if (safe_update && const_cond)
   {
     my_message(ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE,
-               ER(ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE), MYF(0));
+               ER_THD(thd, ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE), MYF(0));
     DBUG_RETURN(TRUE);
   }
 
@@ -369,6 +370,7 @@ bool mysql_delete(THD *thd, TABLE_LIST *table_list, COND *conds,
       goto cleanup;
     }
     /* Handler didn't support fast delete; Delete rows one by one */
+    query_plan.cancel_delete_all_rows();
   }
   if (conds)
   {
@@ -435,7 +437,7 @@ bool mysql_delete(THD *thd, TABLE_LIST *table_list, COND *conds,
       delete select;
       free_underlaid_joins(thd, select_lex);
       my_message(ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE,
-                 ER(ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE), MYF(0));
+                 ER_THD(thd, ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE), MYF(0));
       DBUG_RETURN(TRUE);
     }
   }
@@ -527,17 +529,18 @@ bool mysql_delete(THD *thd, TABLE_LIST *table_list, COND *conds,
     free_underlaid_joins(thd, select_lex);
     DBUG_RETURN(TRUE);
   }
+
   if (query_plan.index == MAX_KEY || (select && select->quick))
-  {
-    if (init_read_record(&info, thd, table, select, 1, 1, FALSE))
-    {
-      delete select;
-      free_underlaid_joins(thd, select_lex);
-      DBUG_RETURN(TRUE);
-    }
-  }
+    error= init_read_record(&info, thd, table, select, 1, 1, FALSE);
   else
-    init_read_record_idx(&info, thd, table, 1, query_plan.index, reverse);
+    error= init_read_record_idx(&info, thd, table, 1, query_plan.index,
+                                reverse);
+  if (error)
+  {
+    delete select;
+    free_underlaid_joins(thd, select_lex);
+    DBUG_RETURN(TRUE);
+  }
 
   init_ftfuncs(thd, select_lex, 1);
   THD_STAGE_INFO(thd, stage_updating);
@@ -892,7 +895,7 @@ int mysql_multi_delete_prepare(THD *thd)
   */
   lex->select_lex.exclude_from_table_unique_test= FALSE;
   
-  if (lex->select_lex.save_prep_leaf_tables(thd))
+  if (lex->save_prep_leaf_tables())
     DBUG_RETURN(TRUE);
   
   DBUG_RETURN(FALSE);
@@ -904,7 +907,7 @@ multi_delete::multi_delete(THD *thd_arg, TABLE_LIST *dt, uint num_of_tables_arg)
     num_of_tables(num_of_tables_arg), error(0),
     do_delete(0), transactional_tables(0), normal_tables(0), error_handled(0)
 {
-  tempfiles= (Unique **) sql_calloc(sizeof(Unique *) * num_of_tables);
+  tempfiles= (Unique **) thd_arg->calloc(sizeof(Unique *) * num_of_tables);
 }
 
 

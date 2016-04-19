@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2012, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2015, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2008, Google Inc.
 Copyright (c) 2012, Facebook Inc.
 
@@ -49,13 +49,6 @@ extern my_bool srv_instrument_semaphores;
 #if  defined(UNIV_DEBUG) && !defined(UNIV_HOTBACKUP)
 extern "C" my_bool	timed_mutexes;
 #endif /* UNIV_DEBUG && !UNIV_HOTBACKUP */
-
-#ifdef _WIN32
-typedef LONG lock_word_t;	/*!< On Windows, InterlockedExchange operates
-				on LONG variable */
-#else
-typedef byte lock_word_t;
-#endif
 
 #if defined UNIV_PFS_MUTEX || defined UNIV_PFS_RWLOCK
 
@@ -224,7 +217,7 @@ original non-instrumented functions */
 #  endif /* UNIV_SYNC_DEBUG */
 # else /* UNIV_DEBUG */
 #  define mutex_create(K, M, level)				\
-	mutex_create_func((M), #M)
+	mutex_create_func((M), __FILE__, __LINE__, #M)
 # endif	/* UNIV_DEBUG */
 
 # define mutex_enter(M)	mutex_enter_func((M), __FILE__, __LINE__)

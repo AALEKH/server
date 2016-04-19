@@ -28,6 +28,7 @@ IF(WITH_WSREP AND NOT EMBEDDED_LIBRARY)
     wsrep_binlog.cc
     wsrep_applier.cc
     wsrep_thd.cc
+    wsrep_xid.cc
   )
   SET(WSREP_LIB wsrep)
 ELSE()
@@ -49,8 +50,26 @@ ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc.h
 ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc.cc
 ${CMAKE_CURRENT_BINARY_DIR}/lex_hash.h 
 )
+SET(GEN_DIGEST_SOURCES
+  ${CMAKE_CURRENT_BINARY_DIR}/lex_token.h 
+)
 
-SET_SOURCE_FILES_PROPERTIES(${GEN_SOURCES} PROPERTIES GENERATED 1)
+SET_SOURCE_FILES_PROPERTIES(${GEN_SOURCES}
+                            ${GEN_DIGEST_SOURCES}
+                            PROPERTIES GENERATED 1)
+
+# Gen_lex_token
+# Make sure sql_yacc.h is generated before compiling gen_lex_token
+IF(NOT CMAKE_CROSSCOMPILING)
+  ADD_EXECUTABLE(gen_lex_token gen_lex_token.cc)
+  ADD_DEPENDENCIES(gen_lex_token GenServerSource)
+ENDIF()
+
+ADD_CUSTOM_COMMAND(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/lex_token.h
+  COMMAND gen_lex_token > lex_token.h
+  DEPENDS gen_lex_token
+)
 
 ADD_DEFINITIONS(-DMYSQL_SERVER -DHAVE_EVENT_SCHEDULER)
 
@@ -64,7 +83,7 @@ SET (SQL_SOURCE
                filesort_utils.cc
                filesort.cc gstream.cc sha2.cc
                signal_handler.cc
-               handler.cc hash_filo.h sql_plugin_services.h
+               handler.cc hash_filo.h
                hostname.cc init.cc item.cc item_buff.cc item_cmpfunc.cc 
                item_create.cc item_func.cc item_geofunc.cc item_row.cc 
                item_strfunc.cc item_subselect.cc item_sum.cc item_timefunc.cc 
@@ -80,7 +99,8 @@ SET (SQL_SOURCE
                slave.cc sp.cc sp_cache.cc sp_head.cc sp_pcontext.cc 
                sp_rcontext.cc spatial.cc sql_acl.cc sql_analyse.cc sql_base.cc 
                sql_cache.cc sql_class.cc sql_client.cc sql_crypt.cc sql_crypt.h 
-               sql_cursor.cc sql_db.cc sql_delete.cc sql_derived.cc sql_do.cc 
+               sql_cursor.cc sql_db.cc sql_delete.cc sql_derived.cc
+               sql_digest.cc sql_do.cc 
                sql_error.cc sql_handler.cc sql_get_diagnostics.cc
                sql_help.cc sql_insert.cc sql_lex.cc 
                sql_list.cc sql_load.cc sql_manager.cc
@@ -88,6 +108,7 @@ SET (SQL_SOURCE
                sql_partition.cc sql_plugin.cc sql_prepare.cc sql_rename.cc 
                debug_sync.cc debug_sync.h
                sql_repl.cc sql_select.cc sql_show.cc sql_state.c
+               group_by_handler.cc
                sql_statistics.cc sql_string.cc 
                sql_table.cc sql_test.cc sql_trigger.cc sql_udf.cc sql_union.cc
                sql_update.cc sql_view.cc strfunc.cc table.cc thr_malloc.cc 
@@ -111,15 +132,16 @@ SET (SQL_SOURCE
                opt_index_cond_pushdown.cc opt_subselect.cc
                opt_table_elimination.cc sql_expression_cache.cc
                gcalc_slicescan.cc gcalc_tools.cc
-			   threadpool_common.cc 
-			   ../sql-common/mysql_async.c
-               my_apc.cc my_apc.h
+               threadpool_common.cc ../sql-common/mysql_async.c
+               my_apc.cc my_apc.h mf_iocache_encr.cc
                my_json_writer.cc my_json_writer.h
                rpl_gtid.cc rpl_parallel.cc
+               sql_type.cc sql_type.h
 	       ${WSREP_SOURCES}
                table_cache.cc encryption.cc
                ${CMAKE_CURRENT_BINARY_DIR}/sql_builtin.cc
                ${GEN_SOURCES}
+               ${GEN_DIGEST_SOURCES}
                ${MYSYS_LIBWRAP_SOURCE}
 			   )
   
@@ -140,12 +162,14 @@ RECOMPILE_FOR_EMBEDDED)
 
 ADD_LIBRARY(sql STATIC ${SQL_SOURCE})
 ADD_DEPENDENCIES(sql GenServerSource)
+ADD_DEPENDENCIES(sql GenDigestServerSource)
 DTRACE_INSTRUMENT(sql)
 TARGET_LINK_LIBRARIES(sql ${MYSQLD_STATIC_PLUGIN_LIBS} 
   mysys mysys_ssl dbug strings vio pcre ${LIBJEMALLOC}
   ${LIBWRAP} ${LIBCRYPT} ${LIBDL} ${CMAKE_THREAD_LIBS_INIT}
   ${WSREP_LIB}
-  ${SSL_LIBRARIES})
+  ${SSL_LIBRARIES}
+  ${LIBSYSTEMD})
 
 IF(WIN32)
   SET(MYSQLD_SOURCE main.cc nt_servc.cc nt_servc.h message.rc)
@@ -268,6 +292,11 @@ TARGET_LINK_LIBRARIES(mysql_tzinfo_to_sql mysys mysys_ssl)
 ADD_CUSTOM_TARGET( 
         GenServerSource
         DEPENDS ${GEN_SOURCES}
+)
+
+ADD_CUSTOM_TARGET( 
+        GenDigestServerSource
+        DEPENDS ${GEN_DIGEST_SOURCES}
 )
 
 #Need this only for embedded

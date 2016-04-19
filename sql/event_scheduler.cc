@@ -186,7 +186,7 @@ pre_init_event_thread(THD* thd)
   thd->security_ctx->master_access= 0;
   thd->security_ctx->db_access= 0;
   thd->security_ctx->host_or_ip= (char*)my_localhost;
-  my_net_init(&thd->net, NULL, MYF(MY_THREAD_SPECIFIC));
+  my_net_init(&thd->net, NULL, thd, MYF(MY_THREAD_SPECIFIC));
   thd->security_ctx->set_user((char*)"event_scheduler");
   thd->net.read_timeout= slave_net_timeout;
   thd->variables.option_bits|= OPTION_AUTO_IS_NULL;
@@ -301,6 +301,9 @@ Event_worker_thread::run(THD *thd, Event_queue_element_for_exec *event)
   Event_job_data job_data;
   bool res;
 
+  DBUG_ASSERT(thd->m_digest == NULL);
+  DBUG_ASSERT(thd->m_statement_psi == NULL);
+
   thd->thread_stack= &my_stack;                // remember where our stack is
   res= post_init_event_thread(thd);
 
@@ -329,6 +332,8 @@ Event_worker_thread::run(THD *thd, Event_queue_element_for_exec *event)
                           job_data.definer.str,
                           job_data.dbname.str, job_data.name.str);
 end:
+  DBUG_ASSERT(thd->m_statement_psi == NULL);
+  DBUG_ASSERT(thd->m_digest == NULL);
   DBUG_PRINT("info", ("Done with Event %s.%s", event->dbname.str,
              event->name.str));
 

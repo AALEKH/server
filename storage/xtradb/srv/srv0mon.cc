@@ -1,8 +1,8 @@
 /*****************************************************************************
 
-Copyright (c) 2010, 2013, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2010, 2014, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2012, Facebook Inc.
-Copyright (c) 2013, 2014, MariaDB Corporation
+Copyright (c) 2013, 2016, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -1041,7 +1041,8 @@ static monitor_info_t	innodb_counter_info[] =
 
 	{"adaptive_hash_searches_btree", "adaptive_hash_index",
 	 "Number of searches using B-tree on an index search",
-	 MONITOR_NONE,
+	 static_cast<monitor_type_t>(
+	 MONITOR_EXISTING | MONITOR_DEFAULT_ON),
 	 MONITOR_DEFAULT_START, MONITOR_OVLD_ADAPTIVE_HASH_SEARCH_BTREE},
 
 	{"adaptive_hash_pages_added", "adaptive_hash_index",
@@ -1194,6 +1195,16 @@ static monitor_info_t	innodb_counter_info[] =
 	 "Time (in microseconds) spent to process DICT LRU list",
 	 MONITOR_NONE,
 	 MONITOR_DEFAULT_START, MONITOR_SRV_DICT_LRU_MICROSECOND},
+
+	{"innodb_dict_lru_count_active", "server",
+	 "Number of tables evicted from DICT LRU list in the active loop",
+	 MONITOR_NONE,
+	 MONITOR_DEFAULT_START, MONITOR_SRV_DICT_LRU_EVICT_COUNT_ACTIVE},
+
+	{"innodb_dict_lru_count_idle", "server",
+	 "Number of tables evicted from DICT LRU list in the idle loop",
+	 MONITOR_NONE,
+	 MONITOR_DEFAULT_START, MONITOR_SRV_DICT_LRU_EVICT_COUNT_IDLE},
 
 	{"innodb_checkpoint_usec", "server",
 	 "Time (in microseconds) spent by master thread to do checkpoint",

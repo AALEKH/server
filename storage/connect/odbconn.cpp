@@ -1,7 +1,7 @@
 /************ Odbconn C++ Functions Source Code File (.CPP) ************/
-/*  Name: ODBCONN.CPP  Version 2.1                                     */
+/*  Name: ODBCONN.CPP  Version 2.2                                     */
 /*                                                                     */
-/*  (C) Copyright to the author Olivier BERTRAND          1998-2015    */
+/*  (C) Copyright to the author Olivier BERTRAND          1998-2016    */
 /*                                                                     */
 /*  This file contains the ODBC connection classes functions.          */
 /***********************************************************************/
@@ -11,7 +11,7 @@
 /***********************************************************************/
 #include <my_global.h>
 #include <m_string.h>
-#if defined(WIN32)
+#if defined(__WIN__)
 //nclude <io.h>
 //nclude <fcntl.h>
 #include <direct.h>                      // for getcwd
@@ -45,13 +45,13 @@
 #include "osutil.h"
 
 
-#if defined(WIN32)
+#if defined(__WIN__)
 /***********************************************************************/
 /*  For dynamic load of ODBC32.DLL                                     */
 /***********************************************************************/
 #pragma comment(lib, "odbc32.lib")
 extern "C" HINSTANCE s_hModule;           // Saved module handle
-#endif // WIN32
+#endif // __WIN__
 
 int GetConvSize();
 
@@ -116,16 +116,24 @@ static int GetSQLCType(int type)
 /***********************************************************************/
 /*  TranslateSQLType: translate a SQL Type to a PLG type.              */
 /***********************************************************************/
-int TranslateSQLType(int stp, int prec, int& len, char& v)
+int TranslateSQLType(int stp, int prec, int& len, char& v, bool& w)
   {
   int type;
 
   switch (stp) {
+    case SQL_WVARCHAR:                      //  (-9)
+      w = true;
     case SQL_VARCHAR:                       //   12
       v = 'V';
+      type = TYPE_STRING;
+      break;
+    case SQL_WCHAR:                         //  (-8)
+      w = true;
     case SQL_CHAR:                          //    1
       type = TYPE_STRING;
       break;
+    case SQL_WLONGVARCHAR:                  // (-10)
+      w = true;
     case SQL_LONGVARCHAR:                   //  (-1)
       v = 'V';
       type = TYPE_STRING;
@@ -180,7 +188,6 @@ int TranslateSQLType(int stp, int prec, int& len, char& v)
     case SQL_BINARY:                        //  (-2)
     case SQL_VARBINARY:                     //  (-3)
     case SQL_LONGVARBINARY:                 //  (-4)
-//  case SQL_BIT:                           //  (-7)
     case SQL_GUID:                          // (-11)
     default:
       type = TYPE_ERROR;
@@ -307,8 +314,10 @@ PQRYRES ODBCColumns(PGLOBAL g, char *dsn, char *db, char *table,
                    FLD_TYPE,  FLD_TYPENAME, FLD_PREC,    FLD_LENGTH,
                    FLD_SCALE, FLD_RADIX,    FLD_NULL,    FLD_REM};
   unsigned int length[] = {0, 0, 0, 0, 6, 0, 10, 10, 6, 6, 6, 0};
-  int      n, ncol = 12;
-  PQRYRES  qrp;
+	bool     b[] = {true,true,false,false,false,false,false,false,true,true,false,true};
+  int      i, n, ncol = 12;
+	PCOLRES  crp;
+	PQRYRES  qrp;
   CATPARM *cap;
   ODBConn *ocp = NULL;
 
@@ -355,6 +364,10 @@ PQRYRES ODBCColumns(PGLOBAL g, char *dsn, char *db, char *table,
   /************************************************************************/
   qrp = PlgAllocResult(g, ncol, maxres, IDS_COLUMNS,
                           buftyp, fldtyp, length, false, true);
+
+	for (i = 0, crp = qrp->Colresp; crp; i++, crp = crp->Next)
+		if (b[i])
+			crp->Kdata->SetNullable(true);
 
   if (info || !qrp)                      // Info table
     return qrp;
@@ -410,6 +423,7 @@ PQRYRES ODBCSrcCols(PGLOBAL g, char *dsn, char *src, POPARM sop)
 PQRYRES MyODBCCols(PGLOBAL g, char *dsn, char *tab, bool info)
   {
 //  int      i, type, len, prec;
+  bool     w = false;
 //  PCOLRES  crp, crpt, crpl, crpp;
   PQRYRES  qrp;
   ODBConn *ocp;
@@ -455,7 +469,7 @@ PQRYRES MyODBCCols(PGLOBAL g, char *dsn, char *tab, bool info)
     type = crpt->Kdata->GetIntValue(i);
     len  = crpl->Kdata->GetIntValue(i);
     prec = crpp->Kdata->GetIntValue(i);
-    type = TranslateSQLType(type, prec, len);
+    type = TranslateSQLType(type, prec, len, w);
     crpt->Kdata->SetValue(type, i);
 
     // Some data sources do not count prec in length
@@ -487,8 +501,10 @@ PQRYRES ODBCDrivers(PGLOBAL g, int maxres, bool info)
   int      buftyp[] = {TYPE_STRING, TYPE_STRING};
   XFLD     fldtyp[] = {FLD_NAME, FLD_REM};
   unsigned int length[] = {128, 256};
-  int      ncol = 2;
-  PQRYRES  qrp;
+	bool     b[] = {false, true};
+	int      i, ncol = 2;
+	PCOLRES  crp;
+	PQRYRES  qrp;
   ODBConn *ocp = NULL;
 
   /************************************************************************/
@@ -512,7 +528,11 @@ PQRYRES ODBCDrivers(PGLOBAL g, int maxres, bool info)
   qrp = PlgAllocResult(g, ncol, maxres, IDS_DRIVER, 
                           buftyp, fldtyp, length, false, true);
 
-  /************************************************************************/
+	for (i = 0, crp = qrp->Colresp; crp; i++, crp = crp->Next)
+		if (b[i])
+			crp->Kdata->SetNullable(true);
+
+	/************************************************************************/
   /*  Now get the results into blocks.                                    */
   /************************************************************************/
   if (!info && qrp && ocp->GetDrivers(qrp))
@@ -534,8 +554,10 @@ PQRYRES ODBCDataSources(PGLOBAL g, int maxres, bool info)
   int      buftyp[] = {TYPE_STRING, TYPE_STRING};
   XFLD     fldtyp[] = {FLD_NAME, FLD_REM};
   unsigned int length[] = {0, 256};
-  int      n = 0, ncol = 2;
-  PQRYRES  qrp;
+	bool     b[] = {false, true};
+	int      i, n = 0, ncol = 2;
+	PCOLRES  crp;
+	PQRYRES  qrp;
   ODBConn *ocp = NULL;
 
   /************************************************************************/
@@ -563,7 +585,11 @@ PQRYRES ODBCDataSources(PGLOBAL g, int maxres, bool info)
   qrp = PlgAllocResult(g, ncol, maxres, IDS_DSRC, 
                           buftyp, fldtyp, length, false, true);
 
-  /************************************************************************/
+	for (i = 0, crp = qrp->Colresp; crp; i++, crp = crp->Next)
+		if (b[i])
+			crp->Kdata->SetNullable(true);
+
+	/************************************************************************/
   /*  Now get the results into blocks.                                    */
   /************************************************************************/
   if (!info && qrp && ocp->GetDataSources(qrp))
@@ -587,8 +613,10 @@ PQRYRES ODBCTables(PGLOBAL g, char *dsn, char *db, char *tabpat,
   XFLD     fldtyp[] = {FLD_CAT,  FLD_SCHEM, FLD_NAME,
                        FLD_TYPE, FLD_REM};
   unsigned int length[] = {0, 0, 0, 16, 0};
-  int      n, ncol = 5;
-  PQRYRES  qrp;
+	bool     b[] ={ true, true, false, false, true };
+	int      i, n, ncol = 5;
+	PCOLRES  crp;
+	PQRYRES  qrp;
   CATPARM *cap;
   ODBConn *ocp = NULL;
 
@@ -630,7 +658,11 @@ PQRYRES ODBCTables(PGLOBAL g, char *dsn, char *db, char *tabpat,
   qrp = PlgAllocResult(g, ncol, maxres, IDS_TABLES, buftyp,
                                         fldtyp, length, false, true);
 
-  if (info || !qrp)
+	for (i = 0, crp = qrp->Colresp; crp; i++, crp = crp->Next)
+		if (b[i])
+			crp->Kdata->SetNullable(true);
+
+	if (info || !qrp)
     return qrp;
 
   if (!(cap = AllocCatInfo(g, CAT_TAB, db, tabpat, qrp)))
@@ -867,8 +899,7 @@ bool DBX::BuildErrorMessage(ODBConn* pdb, HSTMT hstmt)
       for (int i = 0; i < MAX_NUM_OF_MSG
               && (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO)
               && strcmp((char*)state, "00000"); i++) {
-        m_ErrMsg[i] = (PSZ)PlugSubAlloc(g, NULL, strlen((char*)msg) + 1);
-        strcpy(m_ErrMsg[i], (char*)msg);
+        m_ErrMsg[i] = (PSZ)PlugDup(g, (char*)msg);
 
         if (trace)
           htrc("%s: %s, Native=%d\n", state, msg, native);
@@ -882,8 +913,7 @@ bool DBX::BuildErrorMessage(ODBConn* pdb, HSTMT hstmt)
     } else {
       snprintf((char*)msg, SQL_MAX_MESSAGE_LENGTH + 1, "%s: %s", m_Msg,
                MSG(BAD_HANDLE_VAL));
-      m_ErrMsg[0] = (PSZ)PlugSubAlloc(g, NULL, strlen((char*)msg) + 1);
-      strcpy(m_ErrMsg[0], (char*)msg);
+      m_ErrMsg[0] = (PSZ)PlugDup(g, (char*)msg);
 
       if (trace)
         htrc("%s: rc=%hd\n", SVP(m_ErrMsg[0]), m_RC); 
@@ -1012,8 +1042,7 @@ PSZ ODBConn::GetStringInfo(ushort infotype)
 //  *buffer = '\0';
     } // endif rc
 
-  p = (char *)PlugSubAlloc(m_G, NULL, strlen(buffer) + 1);
-  strcpy(p, buffer);
+  p = PlugDup(m_G, buffer);
   return p;
   } // end of GetStringInfo
 
@@ -1204,15 +1233,15 @@ bool ODBConn::DriverConnect(DWORD Options)
   SWORD   nResult;
   PUCHAR  ConnOut = (PUCHAR)PlugSubAlloc(m_G, NULL, MAX_CONNECT_LEN);
   UWORD   wConnectOption = SQL_DRIVER_COMPLETE;
-#if defined(WIN32)
+#if defined(__WIN__)
   HWND    hWndTop = GetForegroundWindow();
   HWND    hWnd = GetParent(hWndTop);
 
   if (hWnd == NULL)
     hWnd = GetDesktopWindow();
-#else   // !WIN32
+#else   // !__WIN__
   HWND    hWnd = (HWND)1;
-#endif  // !WIN32
+#endif  // !__WIN__
   PGLOBAL& g = m_G;
   PDBUSER dup = PlgGetUser(g);
 
@@ -1225,10 +1254,10 @@ bool ODBConn::DriverConnect(DWORD Options)
                         SQL_NTS, ConnOut, MAX_CONNECT_LEN,
                         &nResult, wConnectOption);
 
-#if defined(WIN32)
+#if defined(__WIN__)
   if (hWndTop)
     EnableWindow(hWndTop, true);
-#endif   // WIN32
+#endif   // __WIN__
 
   // If user hit 'Cancel'
   if (rc == SQL_NO_DATA_FOUND) {
@@ -1729,7 +1758,9 @@ bool ODBConn::BindParam(ODBCCOL *colp)
   SQLLEN      *strlen = colp->GetStrLen();
   SQLRETURN    rc;
 
+#if 0
   try {
+		// This function is often not or badly implemented by data sources
     rc = SQLDescribeParam(m_hstmt, n, &sqlt, &colsize, &dec, &nul);
 
     if (!Check(rc))
@@ -1737,11 +1768,12 @@ bool ODBConn::BindParam(ODBCCOL *colp)
 
   } catch(DBX *x) {
     sprintf(m_G->Message, "%s: %s", x->m_Msg, x->GetErrorMessage(0));
+#endif // 0
     colsize = colp->GetPrecision();
     sqlt = GetSQLType(buftype);
-    dec = IsTypeChar(buftype) ? 0 : colp->GetScale();
-    nul = SQL_NULLABLE_UNKNOWN;
-  } // end try/catch
+		dec = IsTypeNum(buftype) ? colp->GetScale() : 0;
+		nul = colp->IsNullable() ? SQL_NULLABLE : SQL_NO_NULLS;
+//} // end try/catch
 
   buf = colp->GetBuffer(0);
   len = IsTypeChar(buftype) ? colp->GetBuflen() : 0;
@@ -2244,7 +2276,7 @@ int ODBConn::GetCatInfo(CATPARM *cap)
         rc = SQLTables(hstmt, name.ptr(2), name.length(2),
                               name.ptr(1), name.length(1),
                               name.ptr(0), name.length(0),
-                              cap->Pat, SQL_NTS);
+															cap->Pat, cap->Pat ? SQL_NTS : 0);
         break;
       case CAT_COL:
 //      rc = SQLSetStmtAttr(hstmt, SQL_ATTR_METADATA_ID,
@@ -2253,7 +2285,7 @@ int ODBConn::GetCatInfo(CATPARM *cap)
         rc = SQLColumns(hstmt, name.ptr(2), name.length(2),
                                name.ptr(1), name.length(1),
                                name.ptr(0), name.length(0),
-                               cap->Pat, SQL_NTS);
+															 cap->Pat, cap->Pat ? SQL_NTS : 0);
         break;
       case CAT_KEY:
         fnc = "SQLPrimaryKeys";
@@ -2355,9 +2387,11 @@ int ODBConn::GetCatInfo(CATPARM *cap)
         } // endif rc
 
       for (n = 0, crp = qrp->Colresp; crp; n++, crp = crp->Next) {
-        if (vlen[n] == SQL_NULL_DATA)
+				if (vlen[n] == SQL_NO_TOTAL)
+					ThrowDBX("Unexpected SQL_NO_TOTAL returned from SQLFetch");
+				else if (vlen[n] == SQL_NULL_DATA)
           pval[n]->SetNull(true);
-        else if (crp->Type == TYPE_STRING && vlen[n] != SQL_NULL_DATA)
+        else if (crp->Type == TYPE_STRING/* && vlen[n] != SQL_NULL_DATA*/)
           pval[n]->SetValue_char(pbuf[n], vlen[n]);
         else
           pval[n]->SetNull(false);

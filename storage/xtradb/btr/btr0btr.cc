@@ -1,7 +1,8 @@
 /*****************************************************************************
 
-Copyright (c) 1994, 2013, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1994, 2015, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2012, Facebook Inc.
+Copyright (c) 2014, 2015, MariaDB Corporation
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -739,7 +740,20 @@ btr_root_block_get(
 	zip_size = dict_table_zip_size(index->table);
 	root_page_no = dict_index_get_page(index);
 
-	block = btr_block_get(space, zip_size, root_page_no, mode, index, mtr);
+	block = btr_block_get(space, zip_size, root_page_no, mode, (dict_index_t*)index, mtr);
+
+	if (!block) {
+		index->table->is_encrypted = TRUE;
+		index->table->corrupted = FALSE;
+
+		ib_push_warning(index->table->thd, DB_DECRYPTION_FAILED,
+			"Table %s in tablespace %lu is encrypted but encryption service or"
+			" used key_id is not available. "
+			" Can't continue reading table.",
+			index->table->name, space);
+
+		return NULL;
+	}
 
 	SRV_CORRUPT_TABLE_CHECK(block, return(0););
 
@@ -779,8 +793,14 @@ btr_root_get(
 	const dict_index_t*	index,	/*!< in: index tree */
 	mtr_t*			mtr)	/*!< in: mtr */
 {
-	return(buf_block_get_frame(btr_root_block_get(index, RW_X_LATCH,
-						      mtr)));
+	buf_block_t* root = btr_root_block_get(index, RW_X_LATCH,
+			mtr);
+
+	if (root && root->page.encrypted == true) {
+		root = NULL;
+	}
+
+	return(root ? buf_block_get_frame(root) : NULL);
 }
 
 /**************************************************************//**
@@ -795,7 +815,7 @@ btr_height_get(
 	dict_index_t*	index,	/*!< in: index tree */
 	mtr_t*		mtr)	/*!< in/out: mini-transaction */
 {
-	ulint		height;
+	ulint		height=0;
 	buf_block_t*	root_block;
 
 	ut_ad(mtr_memo_contains(mtr, dict_index_get_lock(index),
@@ -806,13 +826,16 @@ btr_height_get(
         /* S latches the page */
         root_block = btr_root_block_get(index, RW_S_LATCH, mtr);
 
-        height = btr_page_get_level(buf_block_get_frame_fast(root_block), mtr);
+	if (root_block) {
 
-        /* Release the S latch on the root page. */
-        mtr_memo_release(mtr, root_block, MTR_MEMO_PAGE_S_FIX);
+		height = btr_page_get_level(buf_block_get_frame_fast(root_block), mtr);
+
+		/* Release the S latch on the root page. */
+		mtr_memo_release(mtr, root_block, MTR_MEMO_PAGE_S_FIX);
 #ifdef UNIV_SYNC_DEBUG
-        sync_thread_reset_level(&root_block->lock);
+		sync_thread_reset_level(&root_block->lock);
 #endif /* UNIV_SYNC_DEBUG */
+	}
 
 	return(height);
 }
@@ -877,7 +900,7 @@ btr_root_adjust_on_import(
 			return(DB_CORRUPTION););
 
 	block = btr_block_get(
-		space_id, zip_size, root_page_no, RW_X_LATCH, index, &mtr);
+		space_id, zip_size, root_page_no, RW_X_LATCH, (dict_index_t*)index, &mtr);
 
 	page = buf_block_get_frame(block);
 	page_zip = buf_block_get_page_zip(block);
@@ -1260,7 +1283,7 @@ btr_get_size_and_reserved(
 {
 	fseg_header_t*	seg_header;
 	page_t*		root;
-	ulint		n;
+	ulint		n=ULINT_UNDEFINED;
 	ulint		dummy;
 
 	ut_ad(mtr_memo_contains(mtr, dict_index_get_lock(index),
@@ -1274,17 +1297,21 @@ btr_get_size_and_reserved(
 	}
 
 	root = btr_root_get(index, mtr);
+	*used = 0;
 
-	seg_header = root + PAGE_HEADER + PAGE_BTR_SEG_LEAF;
+	if (root) {
 
-	n = fseg_n_reserved_pages(seg_header, used, mtr);
+		seg_header = root + PAGE_HEADER + PAGE_BTR_SEG_LEAF;
 
-	if (flag == BTR_TOTAL_SIZE) {
-		seg_header = root + PAGE_HEADER + PAGE_BTR_SEG_TOP;
+		n = fseg_n_reserved_pages(seg_header, used, mtr);
 
-		n += fseg_n_reserved_pages(seg_header, &dummy, mtr);
-		*used += dummy;
+		if (flag == BTR_TOTAL_SIZE) {
+			seg_header = root + PAGE_HEADER + PAGE_BTR_SEG_TOP;
 
+			n += fseg_n_reserved_pages(seg_header, &dummy, mtr);
+			*used += dummy;
+
+		}
 	}
 
 	return(n);
@@ -2258,7 +2285,7 @@ the tuple. It is assumed that mtr contains an x-latch on the tree.
 NOTE that the operation of this function must always succeed,
 we cannot reverse it: therefore enough free disk space must be
 guaranteed to be available before this function is called.
-@return	inserted record */
+@return	inserted record or NULL if run out of space */
 UNIV_INTERN
 rec_t*
 btr_root_raise_and_insert(
@@ -2319,6 +2346,11 @@ btr_root_raise_and_insert(
 	level = btr_page_get_level(root, mtr);
 
 	new_block = btr_page_alloc(index, 0, FSP_NO_DIR, level, mtr, mtr);
+
+	if (new_block == NULL && os_has_said_disk_full) {
+		return(NULL);
+        }
+
 	new_page = buf_block_get_frame(new_block);
 	new_page_zip = buf_block_get_page_zip(new_block);
 	ut_a(!new_page_zip == !root_page_zip);
@@ -3103,7 +3135,7 @@ this function is called.
 NOTE: jonaso added support for calling function with tuple == NULL
 which cause it to only split a page.
 
-@return inserted record */
+@return inserted record or NULL if run out of space */
 UNIV_INTERN
 rec_t*
 btr_page_split_and_insert(
@@ -3217,9 +3249,18 @@ func_start:
 		}
 	}
 
+	DBUG_EXECUTE_IF("disk_is_full",
+			os_has_said_disk_full = true;
+                        return(NULL););
+
 	/* 2. Allocate a new page to the index */
 	new_block = btr_page_alloc(cursor->index, hint_page_no, direction,
 				   btr_page_get_level(page, mtr), mtr, mtr);
+
+	if (new_block == NULL && os_has_said_disk_full) {
+		return(NULL);
+        }
+
 	new_page = buf_block_get_frame(new_block);
 	new_page_zip = buf_block_get_page_zip(new_block);
 	btr_page_create(new_block, new_page_zip, cursor->index,
@@ -3513,9 +3554,7 @@ btr_level_list_remove_func(
 	ulint			zip_size,/*!< in: compressed page size in bytes
 					or 0 for uncompressed pages */
 	page_t*			page,	/*!< in/out: page to remove */
-#ifdef UNIV_SYNC_DEBUG
-	const dict_index_t*	index,	/*!< in: index tree */
-#endif /* UNIV_SYNC_DEBUG */
+	dict_index_t*		index,	/*!< in: index tree */
 	mtr_t*			mtr)	/*!< in/out: mini-transaction */
 {
 	ulint	prev_page_no;
@@ -5136,18 +5175,20 @@ node_ptr_fails:
 
 /**************************************************************//**
 Checks the consistency of an index tree.
-@return	TRUE if ok */
+@return	DB_SUCCESS if ok, error code if not */
 UNIV_INTERN
-bool
+dberr_t
 btr_validate_index(
 /*===============*/
 	dict_index_t*	index,	/*!< in: index */
 	const trx_t*	trx)	/*!< in: transaction or NULL */
 {
+	dberr_t err = DB_SUCCESS;
+
 	/* Full Text index are implemented by auxiliary tables,
 	not the B-tree */
 	if (dict_index_is_online_ddl(index) || (index->type & DICT_FTS)) {
-		return(true);
+		return(err);
 	}
 
 	mtr_t		mtr;
@@ -5156,13 +5197,18 @@ btr_validate_index(
 
 	mtr_x_lock(dict_index_get_lock(index), &mtr);
 
-	bool	ok = true;
 	page_t*	root = btr_root_get(index, &mtr);
+
+	if (root == NULL && index->table->is_encrypted) {
+		err = DB_DECRYPTION_FAILED;
+		mtr_commit(&mtr);
+		return err;
+	}
 
 	SRV_CORRUPT_TABLE_CHECK(root,
 	{
 		mtr_commit(&mtr);
-		return(FALSE);
+		return(DB_CORRUPTION);
 	});
 
 	ulint	n = btr_page_get_level(root, &mtr);
@@ -5170,14 +5216,14 @@ btr_validate_index(
 	for (ulint i = 0; i <= n; ++i) {
 
 		if (!btr_validate_level(index, trx, n - i)) {
-			ok = false;
+			err = DB_CORRUPTION;
 			break;
 		}
 	}
 
 	mtr_commit(&mtr);
 
-	return(ok);
+	return(err);
 }
 
 /**************************************************************//**

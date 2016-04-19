@@ -201,6 +201,10 @@ extern MY_UNI_CTYPE my_uni_ctype[256];
 #define MY_CS_UNICODE_SUPPLEMENT 16384 /* Non-BMP Unicode characters */
 #define MY_CS_LOWER_SORT 32768 /* If use lower case as weight   */
 #define MY_CS_STRNXFRM_BAD_NWEIGHTS 0x10000 /* strnxfrm ignores "nweights" */
+#define MY_CS_NOPAD   0x20000  /* if does not ignore trailing spaces */
+#define MY_CS_NON1TO1 0x40000  /* Has a complex mapping from characters
+                                  to weights, e.g. contractions, expansions,
+                                  ignorable characters */
 #define MY_CHARSET_UNDEFINED 0
 
 /* Character repertoire flags */
@@ -351,7 +355,6 @@ struct my_collation_handler_st
   my_bool (*propagate)(CHARSET_INFO *cs, const uchar *str, size_t len);
 };
 
-extern MY_COLLATION_HANDLER my_collation_mb_bin_handler;
 extern MY_COLLATION_HANDLER my_collation_8bit_bin_handler;
 extern MY_COLLATION_HANDLER my_collation_8bit_simple_ci_handler;
 extern MY_COLLATION_HANDLER my_collation_ucs2_uca_handler;
@@ -512,10 +515,25 @@ struct my_charset_handler_st
                       char *dst, size_t dst_length,
                       const char *src, size_t src_length,
                       size_t nchars, MY_STRCOPY_STATUS *status);
+  /**
+    Write a character to the target string, using its native code.
+    For Unicode character sets (utf8, ucs2, utf16, utf16le, utf32, filename)
+    native codes are equvalent to Unicode code points.
+    For 8bit character sets the native code is just the byte value.
+    For Asian characters sets:
+    - MB1 native code is just the byte value (e.g. on the ASCII range)
+    - MB2 native code is ((b0 << 8) + b1).
+    - MB3 native code is ((b0 <<16) + (b1 << 8) + b2)
+    Note, CHARSET_INFO::min_sort_char and CHARSET_INFO::max_sort_char
+    are defined in native notation and should be written using
+    cs->cset->native_to_mb() rather than cs->cset->wc_mb().
+  */
+  my_charset_conv_wc_mb native_to_mb;
 };
 
 extern MY_CHARSET_HANDLER my_charset_8bit_handler;
 extern MY_CHARSET_HANDLER my_charset_ucs2_handler;
+extern MY_CHARSET_HANDLER my_charset_utf8_handler;
 
 
 /*
@@ -665,6 +683,7 @@ extern int my_strcasecmp_8bit(CHARSET_INFO * cs, const char *, const char *);
 
 int my_mb_wc_8bit(CHARSET_INFO *cs,my_wc_t *wc, const uchar *s,const uchar *e);
 int my_wc_mb_8bit(CHARSET_INFO *cs,my_wc_t wc, uchar *s, uchar *e);
+int my_wc_mb_bin(CHARSET_INFO *cs,my_wc_t wc, uchar *s, uchar *e);
 
 int my_mb_ctype_8bit(CHARSET_INFO *,int *, const uchar *,const uchar *);
 int my_mb_ctype_mb(CHARSET_INFO *,int *, const uchar *,const uchar *);
@@ -871,6 +890,18 @@ uint32 my_convert(char *to, uint32 to_length, CHARSET_INFO *to_cs,
                   const char *from, uint32 from_length,
                   CHARSET_INFO *from_cs, uint *errors);
 
+/**
+  An extended version of my_convert(), to pass non-default mb_wc() and wc_mb().
+  For example, String::copy_printable() which is used in
+  Protocol::store_warning() uses this to escape control
+  and non-convertable characters.
+*/
+uint32 my_convert_using_func(char *to, uint32 to_length, CHARSET_INFO *to_cs,
+                             my_charset_conv_wc_mb mb_wc,
+                             const char *from, uint32 from_length,
+                             CHARSET_INFO *from_cs,
+                             my_charset_conv_mb_wc wc_mb,
+                             uint *errors);
 /*
   Convert a string between two character sets.
   Bad byte sequences as well as characters that cannot be

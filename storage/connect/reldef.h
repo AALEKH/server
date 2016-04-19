@@ -1,7 +1,7 @@
 /*************** RelDef H Declares Source Code File (.H) ***************/
-/*  Name: RELDEF.H  Version 1.5                                        */
+/*  Name: RELDEF.H  Version 1.6                                        */
 /*                                                                     */
-/*  (C) Copyright to the author Olivier BERTRAND          2004-2014    */
+/*  (C) Copyright to the author Olivier BERTRAND          2004-2016    */
 /*                                                                     */
 /*  This file contains the DEF classes definitions.                    */
 /***********************************************************************/
@@ -12,6 +12,7 @@
 #include "block.h"
 #include "catalog.h"
 #include "my_sys.h"
+#include "mycat.h"
 
 typedef class  INDEXDEF *PIXDEF;
 typedef class  ha_connect *PHC;
@@ -40,6 +41,7 @@ class DllExport RELDEF : public BLOCK {      // Relation definition block
   void    SetCat(PCATLG cat) { Cat=cat; }
 
   // Methods
+  PTOS    GetTopt(void);
   bool    GetBoolCatInfo(PSZ what, bool bdef);
   bool    SetIntCatInfo(PSZ what, int ival);
   bool    Partitioned(void);
@@ -48,7 +50,8 @@ class DllExport RELDEF : public BLOCK {      // Relation definition block
   int     GetCharCatInfo(PSZ what, PSZ sdef, char *buf, int size);
   char   *GetStringCatInfo(PGLOBAL g, PSZ what, PSZ sdef);
   virtual int  Indexable(void) {return 0;}
-  virtual bool Define(PGLOBAL g, PCATLG cat, LPCSTR name, LPCSTR am) = 0;
+  virtual bool Define(PGLOBAL g, PCATLG cat, 
+		                  LPCSTR name, LPCSTR schema, LPCSTR am) = 0;
   virtual PTDB GetTable(PGLOBAL g, MODE mode) = 0;
 
  protected:
@@ -87,7 +90,7 @@ class DllExport TABDEF : public RELDEF {   /* Logical table descriptor */
   bool    IsReadOnly(void) {return Read_Only;}
   virtual AMT    GetDefType(void) {return TYPE_AM_TAB;}
   virtual PIXDEF GetIndx(void) {return NULL;}
-  virtual void   SetIndx(PIXDEF xp) {}
+  virtual void   SetIndx(PIXDEF) {}
   virtual bool   IsHuge(void) {return false;}
   const CHARSET_INFO *data_charset() {return m_data_charset;}
 
@@ -95,8 +98,9 @@ class DllExport TABDEF : public RELDEF {   /* Logical table descriptor */
           int  GetColCatInfo(PGLOBAL g);
           void SetIndexInfo(void);
           bool DropTable(PGLOBAL g, PSZ name);
-  virtual bool Define(PGLOBAL g, PCATLG cat, LPCSTR name, LPCSTR am);
-  virtual bool DefineAM(PGLOBAL, LPCSTR, int) = 0;
+	virtual bool Define(PGLOBAL g, PCATLG cat,
+						          LPCSTR name, LPCSTR schema, LPCSTR am);
+	virtual bool DefineAM(PGLOBAL, LPCSTR, int) = 0;
 
  protected:
   // Members
@@ -137,11 +141,11 @@ class DllExport OEMDEF : public TABDEF {                  /* OEM table */
   PTABDEF GetXdef(PGLOBAL g);
 
   // Members
-#if defined(WIN32)
+#if defined(__WIN__)
   HANDLE  Hdll;               /* Handle to the external DLL            */
-#else   // !WIN32
+#else   // !__WIN__
   void   *Hdll;               /* Handle for the loaded shared library  */
-#endif  // !WIN32
+#endif  // !__WIN__
   PTABDEF Pxdef;              /* Pointer to the external TABDEF class  */
   char   *Module;             /* Path/Name of the DLL implenting it    */
   char   *Subtype;            /* The name of the OEM table sub type    */
@@ -191,7 +195,8 @@ class DllExport COLDEF : public COLCRT { /* Column description block            
   friend class COLBLK;
   friend class DBFFAM;
   friend class TDBASE;
- public:
+	friend class TDBDOS;
+public:
   COLDEF(void);                // Constructor
 
   // Implementation

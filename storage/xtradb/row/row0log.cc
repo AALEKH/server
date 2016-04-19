@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2011, 2014, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2011, 2015, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -212,8 +212,7 @@ row_log_block_allocate(
 	DBUG_ENTER("row_log_block_allocate");
 	if (log_buf.block == NULL) {
 		log_buf.size = srv_sort_buf_size;
-		log_buf.block = (byte*) os_mem_alloc_large(&log_buf.size,
-							   FALSE);
+		log_buf.block = (byte*) os_mem_alloc_large(&log_buf.size);
 		DBUG_EXECUTE_IF("simulate_row_log_allocation_failure",
 			if (log_buf.block)
 				os_mem_free_large(log_buf.block, log_buf.size);
@@ -1390,6 +1389,27 @@ blob_done:
 			dfield_set_data(dfield, data, len);
 		}
 
+		if (len != UNIV_SQL_NULL && col->mtype == DATA_MYSQL
+		    && col->len != len && !dict_table_is_comp(log->table)) {
+
+			ut_ad(col->len >= len);
+			if (dict_table_is_comp(index->table)) {
+				byte*	buf = (byte*) mem_heap_alloc(heap,
+								     col->len);
+				memcpy(buf, dfield->data, len);
+				memset(buf + len, 0x20, col->len - len);
+
+				dfield_set_data(dfield, buf, col->len);
+			} else {
+				/* field length mismatch should not happen
+				when rebuilding the redundant row format
+				table. */
+				ut_ad(0);
+				*error = DB_CORRUPTION;
+				return(NULL);
+			}
+		}
+
 		/* See if any columns were changed to NULL or NOT NULL. */
 		const dict_col_t*	new_col
 			= dict_table_get_nth_col(log->table, col_no);
@@ -1442,6 +1462,7 @@ row_log_table_apply_insert_low(
 	dtuple_t*	entry;
 	const row_log_t*log	= dup->index->online_log;
 	dict_index_t*	index	= dict_table_get_first_index(log->table);
+	ulint		n_index = 0;
 
 	ut_ad(dtuple_validate(row));
 	ut_ad(trx_id);
@@ -1477,6 +1498,8 @@ row_log_table_apply_insert_low(
 	}
 
 	do {
+		n_index++;
+
 		if (!(index = dict_table_get_next_index(index))) {
 			break;
 		}
@@ -1489,6 +1512,12 @@ row_log_table_apply_insert_low(
 		error = row_ins_sec_index_entry_low(
 			flags, BTR_MODIFY_TREE,
 			index, offsets_heap, heap, entry, trx_id, thr);
+
+		/* Report correct index name for duplicate key error. */
+		if (error == DB_DUPLICATE_KEY) {
+			thr_get_trx(thr)->error_key_num = n_index;
+		}
+
 	} while (error == DB_SUCCESS);
 
 	return(error);
@@ -1796,6 +1825,7 @@ row_log_table_apply_update(
 	mtr_t		mtr;
 	btr_pcur_t	pcur;
 	dberr_t		error;
+	ulint		n_index = 0;
 
 	ut_ad(dtuple_get_n_fields_cmp(old_pk)
 	      == dict_index_get_n_unique(index));
@@ -2071,6 +2101,8 @@ func_exit_committed:
 			break;
 		}
 
+		n_index++;
+
 		if (index->type & DICT_FTS) {
 			continue;
 		}
@@ -2113,6 +2145,11 @@ func_exit_committed:
 			| BTR_NO_UNDO_LOG_FLAG | BTR_KEEP_SYS_FLAG,
 			BTR_MODIFY_TREE, index, offsets_heap, heap,
 			entry, trx_id, thr);
+
+		/* Report correct index name for duplicate key error. */
+		if (error == DB_DUPLICATE_KEY) {
+			thr_get_trx(thr)->error_key_num = n_index;
+		}
 
 		mtr_start(&mtr);
 	}
@@ -2571,7 +2608,7 @@ all_done:
 		and be ignored when the operation is unsupported. */
 		fallocate(index->online_log->fd,
 			  FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-			  ofs, srv_buf_size);
+			  ofs, srv_sort_buf_size);
 #endif /* FALLOC_FL_PUNCH_HOLE */
 
 		next_mrec = index->online_log->head.block;
@@ -3399,7 +3436,7 @@ all_done:
 		and be ignored when the operation is unsupported. */
 		fallocate(index->online_log->fd,
 			  FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-			  ofs, srv_buf_size);
+			  ofs, srv_sort_buf_size);
 #endif /* FALLOC_FL_PUNCH_HOLE */
 
 		next_mrec = index->online_log->head.block;

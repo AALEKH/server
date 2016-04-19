@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2014, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2015, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2013, 2015, MariaDB Corporation. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
@@ -460,7 +460,7 @@ fil_space_get_latch(
 
 /*******************************************************************//**
 Returns the type of a file space.
-@return	FIL_TABLESPACE or FIL_LOG */
+@return	ULINT_UNDEFINED, or FIL_TABLESPACE or FIL_LOG */
 UNIV_INTERN
 ulint
 fil_space_get_type(
@@ -468,6 +468,7 @@ fil_space_get_type(
 	ulint	id)	/*!< in: space id */
 {
 	fil_space_t*	space;
+	ulint type = ULINT_UNDEFINED;
 
 	ut_ad(fil_system);
 
@@ -475,11 +476,13 @@ fil_space_get_type(
 
 	space = fil_space_get_by_id(id);
 
-	ut_a(space);
-
 	mutex_exit(&fil_system->mutex);
 
-	return(space->purpose);
+	if (space) {
+		type = space->purpose;
+	}
+
+	return(type);
 }
 #endif /* !UNIV_HOTBACKUP */
 
@@ -744,9 +747,7 @@ fil_node_open_file(
 		}
 
 		if (!fsp_flags_is_compressed(flags)) {
-			node->size = (ulint)
-				(size_bytes
-				 / fsp_flags_get_page_size(flags));
+			node->size = (ulint) (size_bytes / UNIV_PAGE_SIZE);
 		} else {
 			node->size = (ulint)
 				(size_bytes
@@ -2012,8 +2013,6 @@ fil_read_first_page(
 						lsn values in data files */
 	lsn_t*		max_flushed_lsn,	/*!< out: max of flushed
 						lsn values in data files */
-	ulint		orig_space_id,		/*!< in: original file space
-						id */
 	fil_space_crypt_t**   crypt_data)       /*<  out: crypt data */
 {
 	byte*		buf;
@@ -2021,6 +2020,7 @@ fil_read_first_page(
 	lsn_t		flushed_lsn;
 	const char*	check_msg = NULL;
 	fil_space_crypt_t* cdata;
+
 
 	buf = static_cast<byte*>(ut_malloc(2 * UNIV_PAGE_SIZE));
 
@@ -2052,6 +2052,10 @@ fil_read_first_page(
 		fsp_flags_get_zip_size(*flags), NULL);
 	cdata = fil_space_read_crypt_data(space, page, offset);
 
+	if (crypt_data) {
+		*crypt_data = cdata;
+	}
+
 	/* If file space is encrypted we need to have at least some
 	encryption service available where to get keys */
 	if ((cdata && cdata->encryption == FIL_SPACE_ENCRYPTION_ON) ||
@@ -2059,16 +2063,14 @@ fil_read_first_page(
 			cdata && cdata->encryption == FIL_SPACE_ENCRYPTION_DEFAULT)) {
 
 		if (!encryption_key_id_exists(cdata->key_id)) {
-			ib_logf(IB_LOG_LEVEL_FATAL,
-				"Tablespace id %ld encrypted but encryption service"
-				" not available. Can't continue opening tablespace.\n",
-				space);
-			ut_error;
-		}
-	}
+			ib_logf(IB_LOG_LEVEL_ERROR,
+				"Tablespace id %ld is encrypted but encryption service"
+				" or used key_id %u is not available. Can't continue opening tablespace.",
+				space, cdata->key_id);
 
-	if (crypt_data) {
-		*crypt_data = cdata;
+			return ("table encrypted but encryption service not available.");
+
+		}
 	}
 
 	ut_free(buf);
@@ -2425,7 +2427,9 @@ fil_op_log_parse_or_replay(
 			if (fil_create_new_single_table_tablespace(
 				    space_id, name, path, flags,
 				    DICT_TF2_USE_TABLESPACE,
-				    FIL_IBD_FILE_INITIAL_SIZE) != DB_SUCCESS) {
+				    FIL_IBD_FILE_INITIAL_SIZE,
+				    FIL_SPACE_ENCRYPTION_DEFAULT,
+				    FIL_DEFAULT_ENCRYPTION_KEY) != DB_SUCCESS) {
 				ut_error;
 			}
 		}
@@ -2990,6 +2994,48 @@ fil_make_isl_name(
 	return(filename);
 }
 
+/** Test if a tablespace file can be renamed to a new filepath by checking
+if that the old filepath exists and the new filepath does not exist.
+@param[in]	space_id	tablespace id
+@param[in]	old_path	old filepath
+@param[in]	new_path	new filepath
+@param[in]	is_discarded	whether the tablespace is discarded
+@return innodb error code */
+dberr_t
+fil_rename_tablespace_check(
+	ulint		space_id,
+	const char*	old_path,
+	const char*	new_path,
+	bool		is_discarded)
+{
+	ulint	exists = false;
+	os_file_type_t	ftype;
+
+	if (!is_discarded
+	    && os_file_status(old_path, &exists, &ftype)
+	    && !exists) {
+		ib_logf(IB_LOG_LEVEL_ERROR,
+			"Cannot rename '%s' to '%s' for space ID %lu"
+			" because the source file does not exist.",
+			old_path, new_path, space_id);
+
+		return(DB_TABLESPACE_NOT_FOUND);
+	}
+
+	exists = false;
+	if (!os_file_status(new_path, &exists, &ftype) || exists) {
+		ib_logf(IB_LOG_LEVEL_ERROR,
+			"Cannot rename '%s' to '%s' for space ID %lu"
+			" because the target file exists."
+			" Remove the target file and try again.",
+			old_path, new_path, space_id);
+
+		return(DB_TABLESPACE_EXISTS);
+	}
+
+	return(DB_SUCCESS);
+}
+
 /*******************************************************************//**
 Renames a single-table tablespace. The tablespace must be cached in the
 tablespace memory cache.
@@ -3194,9 +3240,12 @@ fil_create_link_file(
 
 	link_filepath = fil_make_isl_name(tablename);
 
+	/* Note that OS_FILE_READ_WRITE_CACHED used here to avoid
+	unnecessary errors on O_DIRECT, link files are not really
+	a data files. */
 	file = os_file_create_simple_no_error_handling(
 		innodb_file_data_key, link_filepath,
-		OS_FILE_CREATE, OS_FILE_READ_WRITE, &success, 0);
+		OS_FILE_CREATE, OS_FILE_READ_WRITE_CACHED, &success, 0);
 
 	if (!success) {
 		/* The following call will print an error message */
@@ -3364,9 +3413,11 @@ fil_create_new_single_table_tablespace(
 	const char*	dir_path,	/*!< in: NULL or a dir path */
 	ulint		flags,		/*!< in: tablespace flags */
 	ulint		flags2,		/*!< in: table flags2 */
-	ulint		size)		/*!< in: the initial size of the
+	ulint		size,		/*!< in: the initial size of the
 					tablespace file in pages,
 					must be >= FIL_IBD_FILE_INITIAL_SIZE */
+	fil_encryption_t mode,	/*!< in: encryption mode */
+	ulint		key_id)	/*!< in: encryption key_id */
 {
 	os_file_t	file;
 	ibool		ret;
@@ -3379,6 +3430,7 @@ fil_create_new_single_table_tablespace(
 	bool		is_temp = !!(flags2 & DICT_TF2_TEMPORARY);
 	bool		has_data_dir = FSP_FLAGS_HAS_DATA_DIR(flags);
 	ulint		atomic_writes = FSP_FLAGS_GET_ATOMIC_WRITES(flags);
+	fil_space_crypt_t *crypt_data = NULL;
 
 	ut_a(space_id > 0);
 	ut_ad(!srv_read_only_mode);
@@ -3532,8 +3584,15 @@ fil_create_new_single_table_tablespace(
 		}
 	}
 
+	/* Create crypt data if the tablespace is either encrypted or user has
+	requested it to remain unencrypted. */
+	if (mode == FIL_SPACE_ENCRYPTION_ON || mode == FIL_SPACE_ENCRYPTION_OFF ||
+		srv_encrypt_tables) {
+		crypt_data = fil_space_create_crypt_data(mode, key_id);
+	}
+
 	success = fil_space_create(tablename, space_id, flags, FIL_TABLESPACE,
-		fil_space_create_crypt_data(FIL_SPACE_ENCRYPTION_DEFAULT, FIL_DEFAULT_ENCRYPTION_KEY));
+				   crypt_data);
 
 	if (!success || !fil_node_create(path, size, space_id, FALSE)) {
 		err = DB_ERROR;
@@ -3650,7 +3709,8 @@ fil_open_single_table_tablespace(
 	ulint		flags,		/*!< in: tablespace flags */
 	const char*	tablename,	/*!< in: table name in the
 					databasename/tablename format */
-	const char*	path_in)	/*!< in: tablespace filepath */
+	const char*	path_in,	/*!< in: tablespace filepath */
+	dict_table_t*	table)		/*!< in: table */
 {
 	dberr_t		err = DB_SUCCESS;
 	bool		dict_filepath_same_as_default = false;
@@ -3761,8 +3821,12 @@ fil_open_single_table_tablespace(
 	if (def.success) {
 		def.check_msg = fil_read_first_page(
 			def.file, FALSE, &def.flags, &def.id,
-			&def.lsn, &def.lsn, id, &def.crypt_data);
+			&def.lsn, &def.lsn, &def.crypt_data);
 		def.valid = !def.check_msg;
+
+		if (table) {
+			table->crypt_data = def.crypt_data;
+		}
 
 		/* Validate this single-table-tablespace with SYS_TABLES,
 		but do not compare the DATA_DIR flag, in case the
@@ -3783,8 +3847,12 @@ fil_open_single_table_tablespace(
 	if (remote.success) {
 		remote.check_msg = fil_read_first_page(
 			remote.file, FALSE, &remote.flags, &remote.id,
-			&remote.lsn, &remote.lsn, id, &remote.crypt_data);
+			&remote.lsn, &remote.lsn, &remote.crypt_data);
 		remote.valid = !remote.check_msg;
+
+		if (table) {
+			table->crypt_data = remote.crypt_data;
+		}
 
 		/* Validate this single-table-tablespace with SYS_TABLES,
 		but do not compare the DATA_DIR flag, in case the
@@ -3806,8 +3874,12 @@ fil_open_single_table_tablespace(
 	if (dict.success) {
 		dict.check_msg = fil_read_first_page(
 			dict.file, FALSE, &dict.flags, &dict.id,
-			&dict.lsn, &dict.lsn, id, &dict.crypt_data);
+			&dict.lsn, &dict.lsn, &dict.crypt_data);
 		dict.valid = !dict.check_msg;
+
+		if (table) {
+			table->crypt_data = dict.crypt_data;
+		}
 
 		/* Validate this single-table-tablespace with SYS_TABLES,
 		but do not compare the DATA_DIR flag, in case the
@@ -3990,7 +4062,9 @@ cleanup_and_exit:
 		mem_free(remote.filepath);
 	}
 	if (remote.crypt_data && remote.crypt_data != crypt_data) {
-		fil_space_destroy_crypt_data(&remote.crypt_data);
+		if (err == DB_SUCCESS) {
+			fil_space_destroy_crypt_data(&remote.crypt_data);
+		}
 	}
 	if (dict.success) {
 		os_file_close(dict.file);
@@ -4005,7 +4079,9 @@ cleanup_and_exit:
 		os_file_close(def.file);
 	}
 	if (def.crypt_data && def.crypt_data != crypt_data) {
-		fil_space_destroy_crypt_data(&def.crypt_data);
+		if (err == DB_SUCCESS) {
+			fil_space_destroy_crypt_data(&def.crypt_data);
+		}
 	}
 
 	mem_free(def.filepath);
@@ -4105,8 +4181,11 @@ fil_user_tablespace_find_space_id(
 					false, page, 0);
 			}
 
-			bool compressed_ok = !buf_page_is_corrupted(
-				false, page, page_size);
+			bool compressed_ok = false;
+			if (page_size <= UNIV_PAGE_SIZE_DEF) {
+				compressed_ok = !buf_page_is_corrupted(
+					false, page, page_size);
+			}
 
 			if (uncompressed_ok || compressed_ok) {
 
@@ -4225,7 +4304,7 @@ check_first_page:
 	fsp->success = TRUE;
 	if (const char* check_msg = fil_read_first_page(
 		    fsp->file, FALSE, &fsp->flags, &fsp->id,
-		    &fsp->lsn, &fsp->lsn, ULINT_UNDEFINED, &fsp->crypt_data)) {
+		    &fsp->lsn, &fsp->lsn, &fsp->crypt_data)) {
 		ib_logf(IB_LOG_LEVEL_ERROR,
 			"%s in tablespace %s (table %s)",
 			check_msg, fsp->filepath, tablename);
@@ -5220,9 +5299,9 @@ retry:
 		success = os_file_write(node->name, node->handle, buf,
 					offset, page_size * n_pages);
 #else
-		success = os_aio(OS_FILE_WRITE, OS_AIO_SYNC,
+		success = os_aio(OS_FILE_WRITE, 0, OS_AIO_SYNC,
 				 node->name, node->handle, buf,
-				 offset, page_size * n_pages,
+				 offset, page_size * n_pages, page_size,
 				 node, NULL, space_id, NULL, 0);
 #endif /* UNIV_HOTBACKUP */
 
@@ -5623,17 +5702,19 @@ fil_space_get_block_size(
 	ulint	len)
 {
 	ulint block_size = 512;
+	ut_ad(!mutex_own(&fil_system->mutex));
+
+	mutex_enter(&fil_system->mutex);
 	fil_space_t* space = fil_space_get_space(space_id);
 
 	if (space) {
-		mutex_enter(&fil_system->mutex);
 		fil_node_t* node = fil_space_get_node(space, space_id, &block_offset, 0, len);
-		mutex_exit(&fil_system->mutex);
 
 		if (node) {
 			block_size = node->file_block_size;
 		}
 	}
+	mutex_exit(&fil_system->mutex);
 
 	return block_size;
 }
@@ -5753,9 +5834,10 @@ _fil_io(
 
 	space = fil_space_get_by_id(space_id);
 
-	/* If we are deleting a tablespace we don't allow any read
-	operations on that. However, we do allow write operations. */
-	if (space == 0 || (type == OS_FILE_READ && space->stop_new_ops)) {
+	/* If we are deleting a tablespace we don't allow async read operations
+	on that. However, we do allow write and sync read operations */
+	if (space == 0
+	    || (type == OS_FILE_READ && !sync && space->stop_new_ops)) {
 		mutex_exit(&fil_system->mutex);
 
 		ib_logf(IB_LOG_LEVEL_ERROR,
@@ -5840,6 +5922,8 @@ _fil_io(
 		case 4096: zip_size_shift = 12; break;
 		case 8192: zip_size_shift = 13; break;
 		case 16384: zip_size_shift = 14; break;
+		case 32768: zip_size_shift = 15; break;
+		case 65536: zip_size_shift = 16; break;
 		default: ut_error;
 		}
 		offset = ((os_offset_t) block_offset << zip_size_shift)
@@ -5883,12 +5967,14 @@ _fil_io(
 	/* Queue the aio request */
 	ret = os_aio(
 		type,
+		is_log,
 		mode | wake_later,
 		node->name,
 		node->handle,
 		buf,
 		offset,
 		len,
+		zip_size ? zip_size : UNIV_PAGE_SIZE,
 		node,
 		message,
 		space_id,
@@ -5921,9 +6007,9 @@ _fil_io(
 
 	if (!ret) {
 		return(DB_OUT_OF_FILE_SPACE);
-	} else {
-		return(DB_SUCCESS);
 	}
+
+	return(DB_SUCCESS);
 }
 
 #ifndef UNIV_HOTBACKUP
@@ -6448,8 +6534,17 @@ fil_iterate(
 		ut_ad(!(n_bytes % iter.page_size));
 
 		byte* readptr = io_buffer;
-		if (iter.crypt_data != NULL) {
+		byte* writeptr = io_buffer;
+		bool encrypted = false;
+
+		/* Use additional crypt io buffer if tablespace is encrypted */
+		if ((iter.crypt_data != NULL && iter.crypt_data->encryption == FIL_SPACE_ENCRYPTION_ON) ||
+				(srv_encrypt_tables &&
+					iter.crypt_data && iter.crypt_data->encryption == FIL_SPACE_ENCRYPTION_DEFAULT)) {
+
+			encrypted = true;
 			readptr = iter.crypt_io_buffer;
+			writeptr = iter.crypt_io_buffer;
 		}
 
 		if (!os_file_read(iter.file, readptr, offset, (ulint) n_bytes)) {
@@ -6462,24 +6557,49 @@ fil_iterate(
 		bool		updated = false;
 		os_offset_t	page_off = offset;
 		ulint		n_pages_read = (ulint) n_bytes / iter.page_size;
+		bool		decrypted = false;
 
 		for (ulint i = 0; i < n_pages_read; ++i) {
+			ulint 	size = iter.page_size;
+			dberr_t	err = DB_SUCCESS;
+			byte*	src = (readptr + (i * size));
+			byte*	dst = (io_buffer + (i * size));
 
-			if (iter.crypt_data != NULL) {
-				bool decrypted = fil_space_decrypt(
-					iter.crypt_data,
-					readptr + i * iter.page_size,    // src
-					iter.page_size,
-					io_buffer + i * iter.page_size); // dst
+			ulint page_type = mach_read_from_2(src+FIL_PAGE_TYPE);
+
+			bool page_compressed = (page_type == FIL_PAGE_PAGE_COMPRESSED_ENCRYPTED ||
+				page_type == FIL_PAGE_PAGE_COMPRESSED);
+
+			/* If tablespace is encrypted, we need to decrypt
+			the page. */
+			if (encrypted) {
+				decrypted = fil_space_decrypt(
+							iter.crypt_data,
+							dst, //dst
+							iter.page_size,
+							src, // src
+							&err); // src
+
+				if (err != DB_SUCCESS) {
+					return(err);
+				}
+
 				if (decrypted) {
-					/* write back unencrypted page */
 					updated = true;
+				} else {
+					/* TODO: remove unnecessary memcpy's */
+					memcpy(dst, src, size);
 				}
 			}
 
-			buf_block_set_file_page(block, space_id, page_no++);
+			/* If the original page is page_compressed, we need
+			to decompress page before we can update it. */
+			if (page_compressed) {
+				fil_decompress_page(NULL, dst, size, NULL);
+				updated = true;
+			}
 
-			dberr_t	err;
+			buf_block_set_file_page(block, space_id, page_no++);
 
 			if ((err = callback(page_off, block)) != DB_SUCCESS) {
 
@@ -6493,6 +6613,50 @@ fil_iterate(
 			buf_block_set_state(block, BUF_BLOCK_NOT_USED);
 			buf_block_set_state(block, BUF_BLOCK_READY_FOR_USE);
 
+			src =  (io_buffer + (i * size));
+
+			if (page_compressed) {
+				ulint len = 0;
+				fil_compress_page(space_id,
+					src,
+					NULL,
+					size,
+					fil_space_get_page_compression_level(space_id),
+					fil_space_get_block_size(space_id, offset, size),
+					encrypted,
+					&len,
+					NULL);
+
+				updated = true;
+			}
+
+			/* If tablespace is encrypted, encrypt page before we
+			write it back. Note that we should not encrypt the
+			buffer that is in buffer pool. */
+			if (decrypted && encrypted) {
+				unsigned char *dest = (writeptr + (i * size));
+				ulint space = mach_read_from_4(
+					src + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID);
+				ulint offset = mach_read_from_4(src + FIL_PAGE_OFFSET);
+				ib_uint64_t lsn = mach_read_from_8(src + FIL_PAGE_LSN);
+
+				byte* tmp = fil_encrypt_buf(
+							iter.crypt_data,
+							space,
+							offset,
+							lsn,
+							src,
+							iter.page_size == UNIV_PAGE_SIZE ? 0 : iter.page_size,
+							dest);
+
+				if (tmp == src) {
+					/* TODO: remove unnecessary memcpy's */
+					memcpy(dest, src, size);
+				}
+
+				updated = true;
+			}
+
 			page_off += iter.page_size;
 			block->frame += iter.page_size;
 		}
@@ -6500,7 +6664,7 @@ fil_iterate(
 		/* A page was updated in the set, write back to disk. */
 		if (updated
 		    && !os_file_write(
-				iter.filepath, iter.file, io_buffer,
+				iter.filepath, iter.file, writeptr,
 				offset, (ulint) n_bytes)) {
 
 			ib_logf(IB_LOG_LEVEL_ERROR, "os_file_write() failed");
@@ -6662,28 +6826,6 @@ fil_tablespace_iterate(
 		mem_free(io_buffer);
 
 		if (iter.crypt_data != NULL) {
-			/* clear crypt data from page 0 and write it back */
-			os_file_read(file, page, 0, UNIV_PAGE_SIZE);
-			fil_space_clear_crypt_data(page, crypt_data_offset);
-			lsn_t lsn = mach_read_from_8(page + FIL_PAGE_LSN);
-			if (callback.get_zip_size() == 0) {
-				buf_flush_init_for_writing(
-					page, 0, lsn);
-			} else {
-				buf_flush_update_zip_checksum(
-					page, callback.get_zip_size(), lsn);
-			}
-
-			if (!os_file_write(
-				    iter.filepath, iter.file, page,
-				    0, iter.page_size)) {
-
-				ib_logf(IB_LOG_LEVEL_ERROR,
-					"os_file_write() failed");
-
-				return(DB_IO_ERROR);
-			}
-
 			mem_free(crypt_io_buffer);
 			iter.crypt_io_buffer = NULL;
 			fil_space_destroy_crypt_data(&iter.crypt_data);
@@ -6821,31 +6963,110 @@ fil_get_space_names(
 	return(err);
 }
 
-/****************************************************************//**
-Generate redo logs for swapping two .ibd files */
+/** Generate redo log for swapping two .ibd files
+@param[in]	old_table	old table
+@param[in]	new_table	new table
+@param[in]	tmp_name	temporary table name
+@param[in,out]	mtr		mini-transaction
+@return innodb error code */
 UNIV_INTERN
-void
+dberr_t
 fil_mtr_rename_log(
-/*===============*/
-	ulint		old_space_id,	/*!< in: tablespace id of the old
-					table. */
-	const char*	old_name,	/*!< in: old table name */
-	ulint		new_space_id,	/*!< in: tablespace id of the new
-					table */
-	const char*	new_name,	/*!< in: new table name */
-	const char*	tmp_name,	/*!< in: temp table name used while
-					swapping */
-	mtr_t*		mtr)		/*!< in/out: mini-transaction */
+	const dict_table_t*	old_table,
+	const dict_table_t*	new_table,
+	const char*		tmp_name,
+	mtr_t*			mtr)
 {
-	if (old_space_id != TRX_SYS_SPACE) {
-		fil_op_write_log(MLOG_FILE_RENAME, old_space_id,
-				 0, 0, old_name, tmp_name, mtr);
+	dberr_t	err = DB_SUCCESS;
+	char*	old_path;
+
+	/* If neither table is file-per-table,
+	there will be no renaming of files. */
+	if (old_table->space == TRX_SYS_SPACE
+	    && new_table->space == TRX_SYS_SPACE) {
+		return(DB_SUCCESS);
 	}
 
-	if (new_space_id != TRX_SYS_SPACE) {
-		fil_op_write_log(MLOG_FILE_RENAME, new_space_id,
-				 0, 0, new_name, old_name, mtr);
+	if (DICT_TF_HAS_DATA_DIR(old_table->flags)) {
+		old_path = os_file_make_remote_pathname(
+			old_table->data_dir_path, old_table->name, "ibd");
+	} else {
+		old_path = fil_make_ibd_name(old_table->name, false);
 	}
+	if (old_path == NULL) {
+		return(DB_OUT_OF_MEMORY);
+	}
+
+	if (old_table->space != TRX_SYS_SPACE) {
+		char*	tmp_path;
+
+		if (DICT_TF_HAS_DATA_DIR(old_table->flags)) {
+			tmp_path = os_file_make_remote_pathname(
+				old_table->data_dir_path, tmp_name, "ibd");
+		}
+		else {
+			tmp_path = fil_make_ibd_name(tmp_name, false);
+		}
+
+		if (tmp_path == NULL) {
+			mem_free(old_path);
+			return(DB_OUT_OF_MEMORY);
+		}
+
+		/* Temp filepath must not exist. */
+		err = fil_rename_tablespace_check(
+			old_table->space, old_path, tmp_path,
+			dict_table_is_discarded(old_table));
+		mem_free(tmp_path);
+		if (err != DB_SUCCESS) {
+			mem_free(old_path);
+			return(err);
+		}
+
+		fil_op_write_log(MLOG_FILE_RENAME, old_table->space,
+				 0, 0, old_table->name, tmp_name, mtr);
+	}
+
+	if (new_table->space != TRX_SYS_SPACE) {
+
+		/* Destination filepath must not exist unless this ALTER
+		TABLE starts and ends with a file_per-table tablespace. */
+		if (old_table->space == TRX_SYS_SPACE) {
+			char*	new_path = NULL;
+
+			if (DICT_TF_HAS_DATA_DIR(new_table->flags)) {
+				new_path = os_file_make_remote_pathname(
+					new_table->data_dir_path,
+					new_table->name, "ibd");
+			}
+			else {
+				new_path = fil_make_ibd_name(
+					new_table->name, false);
+			}
+
+			if (new_path == NULL) {
+				mem_free(old_path);
+				return(DB_OUT_OF_MEMORY);
+			}
+
+			err = fil_rename_tablespace_check(
+				new_table->space, new_path, old_path,
+				dict_table_is_discarded(new_table));
+			mem_free(new_path);
+			if (err != DB_SUCCESS) {
+				mem_free(old_path);
+				return(err);
+			}
+		}
+
+		fil_op_write_log(MLOG_FILE_RENAME, new_table->space,
+				 0, 0, new_table->name, old_table->name, mtr);
+
+	}
+
+	mem_free(old_path);
+
+	return(err);
 }
 
 /*************************************************************************

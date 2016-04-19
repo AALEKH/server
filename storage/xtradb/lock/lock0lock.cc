@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2014, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2015, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2014, 2015, MariaDB Corporation
 
 This program is free software; you can redistribute it and/or modify it under
@@ -53,6 +53,9 @@ Created 5/7/1996 Heikki Tuuri
 #include "mysql/plugin.h"
 
 #include <mysql/service_wsrep.h>
+
+#include <string>
+#include <sstream>
 
 /* Restricts the length of search we will do in the waits-for
 graph of transactions */
@@ -387,8 +390,10 @@ because there is no parallel deadlock check. This stack is protected by
 the lock_sys_t::mutex. */
 static lock_stack_t*	lock_stack;
 
+#ifdef UNIV_DEBUG
 /** The count of the types of locks. */
 static const ulint	lock_types = UT_ARR_SIZE(lock_compatibility_matrix);
+#endif /* UNIV_DEBUG */
 
 #ifdef UNIV_PFS_MUTEX
 /* Key to register mutex with performance schema */
@@ -1065,12 +1070,13 @@ lock_rec_has_to_wait(
 #ifdef WITH_WSREP
 		/* if BF thread is locking and has conflict with another BF
 		   thread, we need to look at trx ordering and lock types */
-		if (for_locking                                    &&
-		    wsrep_thd_is_BF(trx->mysql_thd, FALSE)         &&
+		if (wsrep_thd_is_BF(trx->mysql_thd, FALSE)         &&
 		    wsrep_thd_is_BF(lock2->trx->mysql_thd, TRUE)) {
 
 			if (wsrep_debug) {
-				fprintf(stderr, "\n BF-BF lock conflict \n");
+				fprintf(stderr,
+					"BF-BF lock conflict, locking: %lu\n",
+					for_locking);
 				lock_rec_print(stderr, lock2);
 			}
 
@@ -1079,16 +1085,21 @@ lock_rec_has_to_wait(
 			    (type_mode & LOCK_MODE_MASK) == LOCK_X        &&
 			    (lock2->type_mode & LOCK_MODE_MASK) == LOCK_X)
 			{
-				/* exclusive lock conflicts are not accepted */
-				fprintf(stderr, "BF-BF X lock conflict,"
-					"type_mode: %lu supremum: %lu\n",
-					type_mode, lock_is_on_supremum);
-				fprintf(stderr, "conflicts states: my %d locked %d\n",
-					wsrep_thd_conflict_state(trx->mysql_thd, FALSE),
-					wsrep_thd_conflict_state(lock2->trx->mysql_thd, FALSE) );
-				lock_rec_print(stderr, lock2);
-				return FALSE;
-				//abort();
+				if (for_locking || wsrep_debug) {
+					/* exclusive lock conflicts are not
+					   accepted */
+					fprintf(stderr,
+						"BF-BF X lock conflict,"
+						"mode: %lu supremum: %lu\n",
+						type_mode, lock_is_on_supremum);
+					fprintf(stderr,
+						"conflicts states: my %d locked %d\n",
+						wsrep_thd_conflict_state(trx->mysql_thd, FALSE), 
+						wsrep_thd_conflict_state(lock2->trx->mysql_thd, FALSE) );
+					lock_rec_print(stderr, lock2);
+					if (for_locking) return FALSE;
+					//abort();
+				}
 			} else {
 				/* if lock2->index->n_uniq <=
 				   lock2->index->n_user_defined_cols
@@ -1718,8 +1729,10 @@ wsrep_kill_victim(
 				}
 			}
 
+			lock->trx->abort_type = TRX_WSREP_ABORT;
 			wsrep_innobase_kill_one_trx(trx->mysql_thd,
 				(const trx_t*) trx, lock->trx, TRUE);
+			lock->trx->abort_type = TRX_SERVER_ABORT;
 		}
 	}
 }
@@ -2333,7 +2346,8 @@ lock_rec_add_to_queue(
 
 	ut_ad(lock_mutex_own());
 	ut_ad(caller_owns_trx_mutex == trx_mutex_own(trx));
-	ut_ad(dict_index_is_clust(index) || !dict_index_is_online_ddl(index));
+	ut_ad(dict_index_is_clust(index)
+	      || dict_index_get_online_status(index) != ONLINE_INDEX_CREATION);
 #ifdef UNIV_DEBUG
 	switch (type_mode & LOCK_MODE_MASK) {
 	case LOCK_X:
@@ -3007,8 +3021,8 @@ lock_rec_inherit_to_gap(
 	/* If srv_locks_unsafe_for_binlog is TRUE or session is using
 	READ COMMITTED isolation level, we do not want locks set
 	by an UPDATE or a DELETE to be inherited as gap type locks. But we
-	DO want S-locks set by a consistency constraint to be inherited also
-	then. */
+	DO want S-locks/X-locks(taken for replace) set by a consistency
+	constraint to be inherited also then */
 
 	for (lock = lock_rec_get_first(block, heap_no);
 	     lock != NULL;
@@ -3018,7 +3032,8 @@ lock_rec_inherit_to_gap(
 		    && !((srv_locks_unsafe_for_binlog
 			  || lock->trx->isolation_level
 			  <= TRX_ISO_READ_COMMITTED)
-			 && lock_get_mode(lock) == LOCK_X)) {
+			 && lock_get_mode(lock) ==
+			 (lock->trx->duplicates ? LOCK_S : LOCK_X))) {
 
 			lock_rec_add_to_queue(
 				LOCK_REC | LOCK_GAP | lock_get_mode(lock),
@@ -4459,9 +4474,9 @@ lock_report_waiters_to_mysql(
 				innobase_kill_query. We mark this by setting
 				current_lock_mutex_owner, so we can avoid trying
 				to recursively take lock_sys->mutex. */
-				w_trx->current_lock_mutex_owner = mysql_thd;
+				w_trx->abort_type = TRX_REPLICATION_ABORT;
 				thd_report_wait_for(mysql_thd, w_trx->mysql_thd);
-				w_trx->current_lock_mutex_owner = NULL;
+				w_trx->abort_type = TRX_SERVER_ABORT;
 			}
 			++i;
 		}
@@ -6019,7 +6034,7 @@ loop:
 		}
 	}
 
-        if (!srv_print_innodb_lock_monitor && !srv_show_locks_held) {
+	if (!srv_print_innodb_lock_monitor || !srv_show_locks_held) {
 		nth_trx++;
 		goto loop;
 	}
@@ -6875,8 +6890,9 @@ lock_clust_rec_modify_check_and_lock(
 	lock_rec_convert_impl_to_expl(block, rec, index, offsets);
 
 	lock_mutex_enter();
+	trx_t*		trx = thr_get_trx(thr);
 
-	ut_ad(lock_table_has(thr_get_trx(thr), index->table, LOCK_IX));
+	ut_ad(lock_table_has(trx, index->table, LOCK_IX));
 
 	err = lock_rec_lock(TRUE, LOCK_X | LOCK_REC_NOT_GAP,
 			    block, heap_no, index, thr);
@@ -6938,9 +6954,10 @@ lock_sec_rec_modify_check_and_lock(
 	index record, and this would not have been possible if another active
 	transaction had modified this secondary index record. */
 
+	trx_t* trx = thr_get_trx(thr);
 	lock_mutex_enter();
 
-	ut_ad(lock_table_has(thr_get_trx(thr), index->table, LOCK_IX));
+	ut_ad(lock_table_has(trx, index->table, LOCK_IX));
 
 	err = lock_rec_lock(TRUE, LOCK_X | LOCK_REC_NOT_GAP,
 			    block, heap_no, index, thr);
@@ -7046,12 +7063,13 @@ lock_sec_rec_read_check_and_lock(
 		lock_rec_convert_impl_to_expl(block, rec, index, offsets);
 	}
 
+	trx_t* trx = thr_get_trx(thr);
 	lock_mutex_enter();
 
 	ut_ad(mode != LOCK_X
-	      || lock_table_has(thr_get_trx(thr), index->table, LOCK_IX));
+	      || lock_table_has(trx, index->table, LOCK_IX));
 	ut_ad(mode != LOCK_S
-	      || lock_table_has(thr_get_trx(thr), index->table, LOCK_IS));
+	      || lock_table_has(trx, index->table, LOCK_IS));
 
 	err = lock_rec_lock(FALSE, mode | gap_mode,
 			    block, heap_no, index, thr);
@@ -7128,11 +7146,12 @@ lock_clust_rec_read_check_and_lock(
 	}
 
 	lock_mutex_enter();
+	trx_t* trx = thr_get_trx(thr);
 
 	ut_ad(mode != LOCK_X
-	      || lock_table_has(thr_get_trx(thr), index->table, LOCK_IX));
+	      || lock_table_has(trx, index->table, LOCK_IX));
 	ut_ad(mode != LOCK_S
-	      || lock_table_has(thr_get_trx(thr), index->table, LOCK_IS));
+	      || lock_table_has(trx, index->table, LOCK_IS));
 
 	err = lock_rec_lock(FALSE, mode | gap_mode,
 			    block, heap_no, index, thr);
@@ -7282,6 +7301,19 @@ lock_get_type(
 	const lock_t*	lock)	/*!< in: lock */
 {
 	return(lock_get_type_low(lock));
+}
+
+/*******************************************************************//**
+Gets the trx of the lock. Non-inline version for using outside of the
+lock module.
+@return	trx_t* */
+UNIV_INTERN
+trx_t*
+lock_get_trx(
+/*=========*/
+	const lock_t*	lock)	/*!< in: lock */
+{
+	return (lock->trx);
 }
 
 /*******************************************************************//**
@@ -7875,3 +7907,32 @@ lock_trx_has_rec_x_lock(
 	return(true);
 }
 #endif /* UNIV_DEBUG */
+
+/*******************************************************************//**
+Get lock mode and table/index name
+@return	string containing lock info */
+std::string
+lock_get_info(
+	const lock_t* lock)
+{
+	std::string info;
+	std::string mode("mode ");
+	std::string index("index ");
+	std::string table("table ");
+	std::string n_uniq(" n_uniq");
+	std::string n_user(" n_user");
+	std::string lock_mode((lock_get_mode_str(lock)));
+	std::string iname(lock->index->name);
+	std::string tname(lock->index->table_name);
+
+#define SSTR( x ) reinterpret_cast< std::ostringstream & >(	\
+        ( std::ostringstream() << std::dec << x ) ).str()
+
+	info = mode + lock_mode
+		+ index + iname
+		+ table + tname
+		+ n_uniq + SSTR(lock->index->n_uniq)
+		+ n_user + SSTR(lock->index->n_user_defined_cols);
+
+	return info;
+}

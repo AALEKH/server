@@ -20,8 +20,6 @@
 #include "ma_blockrec.h"
 #include <my_crypt.h>
 
-#define HARD_CODED_ENCRYPTION_KEY_ID 1
-
 #define CRYPT_SCHEME_1         1
 #define CRYPT_SCHEME_1_ID_LEN  4 /* 4 bytes for counter-block */
 #define CRYPT_SCHEME_1_IV_LEN           16
@@ -43,6 +41,24 @@ struct st_maria_crypt_data
   uint space;
   mysql_mutex_t lock;          /* protecting keys */
 };
+
+/**
+  determine what key id to use for Aria encryption
+
+  Same logic as for tempfiles: if key id 2 exists - use it,
+  otherwise use key id 1.
+
+  Key id 1 is system, it always exists. Key id 2 is optional,
+  it allows to specify fast low-grade encryption for temporary data.
+*/
+static uint get_encryption_key_id(MARIA_SHARE *share)
+{
+  if (share->options & HA_OPTION_TMP_TABLE &&
+      encryption_key_id_exists(ENCRYPTION_KEY_TEMPORARY_DATA))
+    return ENCRYPTION_KEY_TEMPORARY_DATA;
+  else
+    return ENCRYPTION_KEY_SYSTEM_DATA;
+}
 
 uint
 ma_crypt_get_data_page_header_space()
@@ -90,7 +106,7 @@ ma_crypt_create(MARIA_SHARE* share)
   crypt_data->scheme.type= CRYPT_SCHEME_1;
   crypt_data->scheme.locker= crypt_data_scheme_locker;
   mysql_mutex_init(key_CRYPT_DATA_lock, &crypt_data->lock, MY_MUTEX_INIT_FAST);
-  crypt_data->scheme.key_id= HARD_CODED_ENCRYPTION_KEY_ID;
+  crypt_data->scheme.key_id= get_encryption_key_id(share);
   my_random_bytes(crypt_data->scheme.iv, sizeof(crypt_data->scheme.iv));
   my_random_bytes((uchar*)&crypt_data->space, sizeof(crypt_data->space));
   share->crypt_data= crypt_data;
@@ -156,7 +172,7 @@ ma_crypt_read(MARIA_SHARE* share, uchar *buff)
     mysql_mutex_init(key_CRYPT_DATA_lock, &crypt_data->lock,
                      MY_MUTEX_INIT_FAST);
     crypt_data->scheme.locker= crypt_data_scheme_locker;
-    crypt_data->scheme.key_id= HARD_CODED_ENCRYPTION_KEY_ID;
+    crypt_data->scheme.key_id= get_encryption_key_id(share);
     crypt_data->space= uint4korr(buff + 2);
     memcpy(crypt_data->scheme.iv, buff + 6, sizeof(crypt_data->scheme.iv));
     share->crypt_data= crypt_data;
@@ -166,10 +182,10 @@ ma_crypt_read(MARIA_SHARE* share, uchar *buff)
   return buff + 2 + iv_length;
 }
 
-static int ma_encrypt(MARIA_CRYPT_DATA *, const uchar *, uchar *, uint,
-                      uint, LSN, uint *);
-static int ma_decrypt(MARIA_CRYPT_DATA *, const uchar *, uchar *, uint,
-                      uint, LSN, uint);
+static int ma_encrypt(MARIA_SHARE *, MARIA_CRYPT_DATA *, const uchar *,
+                      uchar *, uint, uint, LSN, uint *);
+static int ma_decrypt(MARIA_SHARE *, MARIA_CRYPT_DATA *, const uchar *,
+                      uchar *, uint, uint, LSN, uint);
 
 static my_bool ma_crypt_pre_read_hook(PAGECACHE_IO_HOOK_ARGS *args)
 {
@@ -211,7 +227,7 @@ static my_bool ma_crypt_data_post_read_hook(int res,
     /* 1 - copy head */
     memcpy(dst, src, head);
     /* 2 - decrypt page */
-    res= ma_decrypt(share->crypt_data,
+    res= ma_decrypt(share, share->crypt_data,
                     src + head, dst + head, size - (head + tail), pageno, lsn,
                     key_version);
     /* 3 - copy tail */
@@ -278,9 +294,9 @@ static my_bool ma_crypt_data_pre_write_hook(PAGECACHE_IO_HOOK_ARGS *args)
     /* 1 - copy head */
     memcpy(dst, src, head);
     /* 2 - encrypt page */
-    if (ma_encrypt(share->crypt_data,
+    if (ma_encrypt(share, share->crypt_data,
                    src + head, dst + head, size - (head + tail), pageno, lsn,
-                  &key_version))
+                   &key_version))
       return 1;
     /* 3 - copy tail */
     memcpy(dst + size - tail, src + size - tail, tail);
@@ -314,7 +330,7 @@ void ma_crypt_set_data_pagecache_callbacks(PAGECACHE_FILE *file,
                                            __attribute__((unused)))
 {
   /* Only use encryption if we have defined it */
-  if (encryption_key_id_exists(HARD_CODED_ENCRYPTION_KEY_ID))
+  if (encryption_key_id_exists(get_encryption_key_id(share)))
   {
     file->pre_read_hook= ma_crypt_pre_read_hook;
     file->post_read_hook= ma_crypt_data_post_read_hook;
@@ -345,7 +361,7 @@ static my_bool ma_crypt_index_post_read_hook(int res,
     /* 1 - copy head */
     memcpy(dst, src, head);
     /* 2 - decrypt page */
-    res= ma_decrypt(share->crypt_data,
+    res= ma_decrypt(share, share->crypt_data,
                     src + head, dst + head, size, pageno, lsn, key_version);
     /* 3 - copy tail */
     memcpy(dst + block_size - tail, src + block_size - tail, tail);
@@ -398,13 +414,20 @@ static my_bool ma_crypt_index_pre_write_hook(PAGECACHE_IO_HOOK_ARGS *args)
     /* 1 - copy head */
     memcpy(dst, src, head);
     /* 2 - encrypt page */
-    if (ma_encrypt(share->crypt_data,
+    if (ma_encrypt(share, share->crypt_data,
                    src + head, dst + head, size, pageno, lsn, &key_version))
+    {
+      my_free(crypt_buf);
       return 1;
+    }
     /* 3 - copy tail */
     memcpy(dst + block_size - tail, src + block_size - tail, tail);
     /* 4 - store key version */
     _ma_store_key_version(share, dst, key_version);
+#ifdef HAVE_valgrind
+    /* 5 - keep valgrind happy by zeroing not used bytes */
+    bzero(dst+head+size, block_size - size - tail - head);
+#endif
   }
 
   /* swap pointers to instead write out the encrypted block */
@@ -424,19 +447,26 @@ void ma_crypt_set_index_pagecache_callbacks(PAGECACHE_FILE *file,
   file->post_write_hook= ma_crypt_post_write_hook;
 }
 
-static int ma_encrypt(MARIA_CRYPT_DATA *crypt_data,
-                       const uchar *src, uchar *dst, uint size,
-                       uint pageno, LSN lsn,
-                       uint *key_version)
+static int ma_encrypt(MARIA_SHARE *share, MARIA_CRYPT_DATA *crypt_data,
+                      const uchar *src, uchar *dst, uint size,
+                      uint pageno, LSN lsn,
+                      uint *key_version)
 {
   int rc;
-  uint32 dstlen;
+  uint32 dstlen= 0;              /* Must be set because of error message */
 
   *key_version = encryption_key_get_latest_version(crypt_data->scheme.key_id);
   if (*key_version == ENCRYPTION_KEY_VERSION_INVALID)
   {
-    my_printf_error(HA_ERR_GENERIC, "Unknown key id %u. Can't continue!",
-                    MYF(ME_FATALERROR|ME_NOREFRESH), crypt_data->scheme.key_id);
+    /*
+      We use this error for both encryption and decryption, as in normal
+      cases it should be impossible to get an error here.
+    */
+    my_errno= HA_ERR_DECRYPTION_FAILED;
+    my_printf_error(HA_ERR_DECRYPTION_FAILED,
+                    "Unknown key id %u. Can't continue!",
+                    MYF(ME_FATALERROR|ME_NOREFRESH),
+                    crypt_data->scheme.key_id);
     return 1;
   }
 
@@ -444,40 +474,43 @@ static int ma_encrypt(MARIA_CRYPT_DATA *crypt_data,
                                 &crypt_data->scheme, *key_version,
                                 crypt_data->space, pageno, lsn);
 
-  DBUG_ASSERT(rc == MY_AES_OK);
-  DBUG_ASSERT(dstlen == size);
+  /* The following can only fail if the encryption key is wrong */
+  DBUG_ASSERT(!my_assert_on_error || rc == MY_AES_OK);
+  DBUG_ASSERT(!my_assert_on_error || dstlen == size);
   if (! (rc == MY_AES_OK && dstlen == size))
   {
-    my_printf_error(HA_ERR_GENERIC,
-                    "failed to encrypt! rc: %d, dstlen: %u size: %u\n",
+    my_errno= HA_ERR_DECRYPTION_FAILED;
+    my_printf_error(HA_ERR_DECRYPTION_FAILED,
+                    "failed to encrypt '%s'  rc: %d  dstlen: %u  size: %u\n",
                     MYF(ME_FATALERROR|ME_NOREFRESH),
-                    rc, dstlen, size);
+                    share->open_file_name.str, rc, dstlen, size);
     return 1;
   }
 
   return 0;
 }
 
-static int ma_decrypt(MARIA_CRYPT_DATA *crypt_data,
+static int ma_decrypt(MARIA_SHARE *share, MARIA_CRYPT_DATA *crypt_data,
                       const uchar *src, uchar *dst, uint size,
                       uint pageno, LSN lsn,
                       uint key_version)
 {
   int rc;
-  uint32 dstlen;
+  uint32 dstlen= 0;              /* Must be set because of error message */
 
   rc= encryption_scheme_decrypt(src, size, dst, &dstlen,
                                 &crypt_data->scheme, key_version,
                                 crypt_data->space, pageno, lsn);
 
-  DBUG_ASSERT(rc == MY_AES_OK);
-  DBUG_ASSERT(dstlen == size);
+  DBUG_ASSERT(!my_assert_on_error || rc == MY_AES_OK);
+  DBUG_ASSERT(!my_assert_on_error || dstlen == size);
   if (! (rc == MY_AES_OK && dstlen == size))
   {
-    my_printf_error(HA_ERR_GENERIC,
-                    "failed to encrypt! rc: %d, dstlen: %u size: %u\n",
+    my_errno= HA_ERR_DECRYPTION_FAILED;
+    my_printf_error(HA_ERR_DECRYPTION_FAILED,
+                    "failed to decrypt '%s'  rc: %d  dstlen: %u  size: %u\n",
                     MYF(ME_FATALERROR|ME_NOREFRESH),
-                    rc, dstlen, size);
+                    share->open_file_name.str, rc, dstlen, size);
     return 1;
   }
   return 0;

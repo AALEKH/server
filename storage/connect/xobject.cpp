@@ -11,6 +11,7 @@
 /*  Include mariaDB header file.                                       */
 /***********************************************************************/
 #include "my_global.h"
+#include "m_string.h"
 
 /***********************************************************************/
 /*  Include required application header files                          */
@@ -288,6 +289,48 @@ bool STRING::Set(char *s, uint n)
   Length = len - 1;
   return false;
 } // end of Set
+
+/***********************************************************************/
+/*  Append a char* to a STRING.                                        */
+/***********************************************************************/
+bool STRING::Append(const char *s, uint ln, bool nq)
+{
+  if (!s)
+    return false;
+
+  uint i, len = Length + ln + 1;
+
+  if (len > Size) {
+    char *p = Realloc(len);
+    
+    if (!p)
+      return true;
+    else if (p != Strp) {
+      strcpy(p, Strp);
+      Strp = p;
+      } // endif p
+
+    } // endif n
+
+	if (nq) {
+		for (i = 0; i < ln; i++)
+			switch (s[i]) {
+			case '\\':   Strp[Length++] = '\\'; Strp[Length++] = '\\'; break;
+			case '\0':   Strp[Length++] = '\\'; Strp[Length++] = '0';  break;
+			case '\'':   Strp[Length++] = '\\'; Strp[Length++] = '\''; break;
+			case '\n':   Strp[Length++] = '\\'; Strp[Length++] = 'n';  break;
+			case '\r':   Strp[Length++] = '\\'; Strp[Length++] = 'r';  break;
+			case '\032': Strp[Length++] = '\\'; Strp[Length++] = 'Z';  break;
+			default:     Strp[Length++] = s[i];
+			}	// endswitch s[i]
+
+	} else
+		for (i = 0; i < ln && s[i]; i++)
+			Strp[Length++] = s[i];
+
+  Strp[Length] = 0;
+  return false;
+} // end of Append
 
 /***********************************************************************/
 /*  Append a PSZ to a STRING.                                          */

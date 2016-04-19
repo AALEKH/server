@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2014, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2015, Oracle and/or its affiliates.
 Copyright (c) 2013, 2015, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
@@ -142,8 +142,11 @@ extern fil_addr_t	fil_addr_null;
 #define FIL_PAGE_DATA		38	/*!< start of the data on the page */
 /* Following are used when page compression is used */
 #define FIL_PAGE_COMPRESSED_SIZE 2      /*!< Number of bytes used to store
- 					actual payload data size on
- 					compressed pages. */
+					actual payload data size on
+					compressed pages. */
+#define FIL_PAGE_COMPRESSION_METHOD_SIZE 2
+					/*!< Number of bytes used to store
+					actual compression method. */
 /* @} */
 /** File page trailer @{ */
 #define FIL_PAGE_END_LSN_OLD_CHKSUM 8	/*!< the low 4 bytes of this are used
@@ -154,6 +157,8 @@ extern fil_addr_t	fil_addr_null;
 /* @} */
 
 /** File page types (values of FIL_PAGE_TYPE) @{ */
+#define FIL_PAGE_PAGE_COMPRESSED_ENCRYPTED 37401 /*!< Page is compressed and
+						 then encrypted */
 #define FIL_PAGE_PAGE_COMPRESSED 34354  /*!< page compressed page */
 #define FIL_PAGE_INDEX		17855	/*!< B-tree node */
 #define FIL_PAGE_UNDO_LOG	2	/*!< Undo log page */
@@ -208,7 +213,8 @@ struct fsp_open_info {
 #ifdef UNIV_LOG_ARCHIVE
 	ulint		arch_log_no;	/*!< latest archived log file number */
 #endif /* UNIV_LOG_ARCHIVE */
-	fil_space_crypt_t* crypt_data; /*!< crypt data */
+	fil_space_crypt_t* crypt_data;	/*!< crypt data */
+	dict_table_t*	table;		/*!< table */
 };
 
 struct fil_space_t;
@@ -606,8 +612,6 @@ fil_read_first_page(
 						lsn values in data files */
 	lsn_t*		max_flushed_lsn,	/*!< out: max of flushed
 						lsn values in data files */
-	ulint		orig_space_id,		/*!< in: file space id or
-						ULINT_UNDEFINED */
 	fil_space_crypt_t** crypt_data)		/*!< out: crypt data */
 
 	__attribute__((warn_unused_result));
@@ -700,6 +704,21 @@ fil_discard_tablespace(
 	ulint	id)	/*!< in: space id */
 	__attribute__((warn_unused_result));
 #endif /* !UNIV_HOTBACKUP */
+
+/** Test if a tablespace file can be renamed to a new filepath by checking
+if that the old filepath exists and the new filepath does not exist.
+@param[in]	space_id	tablespace id
+@param[in]	old_path	old filepath
+@param[in]	new_path	new filepath
+@param[in]	is_discarded	whether the tablespace is discarded
+@return innodb error code */
+dberr_t
+fil_rename_tablespace_check(
+	ulint		space_id,
+	const char*	old_path,
+	const char*	new_path,
+	bool		is_discarded);
+
 /*******************************************************************//**
 Renames a single-table tablespace. The tablespace must be cached in the
 tablespace memory cache.
@@ -771,6 +790,9 @@ char*
 fil_read_link_file(
 /*===============*/
 	const char*	name);		/*!< in: tablespace name */
+
+#include "fil0crypt.h"
+
 /*******************************************************************//**
 Creates a new single-table tablespace to a database directory of MySQL.
 Database directories are under the 'datadir' of MySQL. The datadir is the
@@ -789,9 +811,11 @@ fil_create_new_single_table_tablespace(
 	const char*	dir_path,	/*!< in: NULL or a dir path */
 	ulint		flags,		/*!< in: tablespace flags */
 	ulint		flags2,		/*!< in: table flags2 */
-	ulint		size)		/*!< in: the initial size of the
+	ulint		size,		/*!< in: the initial size of the
 					tablespace file in pages,
 					must be >= FIL_IBD_FILE_INITIAL_SIZE */
+	fil_encryption_t mode,	/*!< in: encryption mode */
+	ulint		key_id)	/*!< in: encryption key_id */
 	__attribute__((nonnull, warn_unused_result));
 #ifndef UNIV_HOTBACKUP
 /********************************************************************//**
@@ -825,7 +849,8 @@ fil_open_single_table_tablespace(
 	ulint		flags,		/*!< in: tablespace flags */
 	const char*	tablename,	/*!< in: table name in the
 					databasename/tablename format */
-	const char*	filepath)	/*!< in: tablespace filepath */
+	const char*	filepath,	/*!< in: tablespace filepath */
+	dict_table_t*	table)		/*!< in: table */
 	__attribute__((nonnull(5), warn_unused_result));
 
 #endif /* !UNIV_HOTBACKUP */
@@ -1201,21 +1226,19 @@ fil_get_space_names(
 				/*!< in/out: Vector for collecting the names. */
 	__attribute__((warn_unused_result));
 
-/****************************************************************//**
-Generate redo logs for swapping two .ibd files */
+/** Generate redo log for swapping two .ibd files
+@param[in]	old_table	old table
+@param[in]	new_table	new table
+@param[in]	tmp_name	temporary table name
+@param[in,out]	mtr		mini-transaction
+@return innodb error code */
 UNIV_INTERN
-void
+dberr_t
 fil_mtr_rename_log(
-/*===============*/
-	ulint		old_space_id,	/*!< in: tablespace id of the old
-					table. */
-	const char*	old_name,	/*!< in: old table name */
-	ulint		new_space_id,	/*!< in: tablespace id of the new
-					table */
-	const char*	new_name,	/*!< in: new table name */
-	const char*	tmp_name,	/*!< in: temp table name used while
-					swapping */
-	mtr_t*		mtr)		/*!< in/out: mini-transaction */
+	const dict_table_t*	old_table,
+	const dict_table_t*	new_table,
+	const char*		tmp_name,
+	mtr_t*			mtr)
 	__attribute__((nonnull));
 
 /*******************************************************************//**

@@ -545,6 +545,10 @@ Note	1003	select `test`.`t1`.`a1` AS `a1`,`test`.`t1`.`a2` AS `a2` from `test`.`
 select * from t1 group by (a1 in (select col from columns));
 a1	a2
 1 - 00	2 - 00
+Warnings:
+Warning	1292	Truncated incorrect DOUBLE value: '1 - 00'
+Warning	1292	Truncated incorrect DOUBLE value: '1 - 01'
+Warning	1292	Truncated incorrect DOUBLE value: '1 - 02'
 /* ORDER BY clause */
 explain extended
 select * from t1 order by (select col from columns limit 1);
@@ -758,6 +762,10 @@ select left(a1,7), left(a2,7)
 from t1_512
 where a1 in (select group_concat(b1) from t2_512 group by b2);
 left(a1,7)	left(a2,7)
+Warnings:
+Warning	1260	Row 1 was cut by GROUP_CONCAT()
+Warning	1260	Row 2 was cut by GROUP_CONCAT()
+Warning	1260	Row 3 was cut by GROUP_CONCAT()
 set @@group_concat_max_len = 256;
 explain extended select left(a1,7), left(a2,7)
 from t1_512
@@ -771,6 +779,10 @@ select left(a1,7), left(a2,7)
 from t1_512
 where a1 in (select group_concat(b1) from t2_512 group by b2);
 left(a1,7)	left(a2,7)
+Warnings:
+Warning	1260	Row 1 was cut by GROUP_CONCAT()
+Warning	1260	Row 2 was cut by GROUP_CONCAT()
+Warning	1260	Row 3 was cut by GROUP_CONCAT()
 drop table t1_512, t2_512, t3_512;
 set @blob_len = 1024;
 set @suffix_len = @blob_len - @prefix_len;
@@ -851,6 +863,10 @@ select left(a1,7), left(a2,7)
 from t1_1024
 where a1 in (select group_concat(b1) from t2_1024 group by b2);
 left(a1,7)	left(a2,7)
+Warnings:
+Warning	1260	Row 1 was cut by GROUP_CONCAT()
+Warning	1260	Row 2 was cut by GROUP_CONCAT()
+Warning	1260	Row 3 was cut by GROUP_CONCAT()
 set @@group_concat_max_len = 256;
 explain extended select left(a1,7), left(a2,7)
 from t1_1024
@@ -864,6 +880,10 @@ select left(a1,7), left(a2,7)
 from t1_1024
 where a1 in (select group_concat(b1) from t2_1024 group by b2);
 left(a1,7)	left(a2,7)
+Warnings:
+Warning	1260	Row 1 was cut by GROUP_CONCAT()
+Warning	1260	Row 2 was cut by GROUP_CONCAT()
+Warning	1260	Row 3 was cut by GROUP_CONCAT()
 drop table t1_1024, t2_1024, t3_1024;
 set @blob_len = 1025;
 set @suffix_len = @blob_len - @prefix_len;
@@ -944,6 +964,10 @@ select left(a1,7), left(a2,7)
 from t1_1025
 where a1 in (select group_concat(b1) from t2_1025 group by b2);
 left(a1,7)	left(a2,7)
+Warnings:
+Warning	1260	Row 1 was cut by GROUP_CONCAT()
+Warning	1260	Row 2 was cut by GROUP_CONCAT()
+Warning	1260	Row 3 was cut by GROUP_CONCAT()
 set @@group_concat_max_len = 256;
 explain extended select left(a1,7), left(a2,7)
 from t1_1025
@@ -957,6 +981,10 @@ select left(a1,7), left(a2,7)
 from t1_1025
 where a1 in (select group_concat(b1) from t2_1025 group by b2);
 left(a1,7)	left(a2,7)
+Warnings:
+Warning	1260	Row 1 was cut by GROUP_CONCAT()
+Warning	1260	Row 2 was cut by GROUP_CONCAT()
+Warning	1260	Row 3 was cut by GROUP_CONCAT()
 drop table t1_1025, t2_1025, t3_1025;
 create table t1bit (a1 bit(3), a2 bit(3));
 create table t2bit (b1 bit(3), b2 bit(3));
@@ -2145,6 +2173,24 @@ drop database mysqltest1;
 drop database mysqltest2;
 drop database mysqltest3;
 drop database mysqltest4;
+#
+# MDEV-7810 Wrong result on execution of a query as a PS
+# (both 1st and further executions)
+CREATE TABLE t1 (a INT NOT NULL) ENGINE=MyISAM;
+INSERT INTO t1 VALUES (0),(8);
+SELECT a FROM (SELECT DISTINCT * FROM t1) AS sq WHERE a IN (SELECT MIN(t2.a) FROM (t1 AS t2));
+a
+0
+PREPARE stmt FROM "
+SELECT a FROM (SELECT DISTINCT * FROM t1) AS sq WHERE a IN (SELECT MIN(t2.a) FROM (t1 AS t2))
+";
+execute stmt;
+a
+0
+execute stmt;
+a
+0
+drop table t1;
 # End of 5.5 tests
 #
 # MDEV-7220: Materialization strategy is not used for REPLACE ... SELECT
@@ -2197,6 +2243,24 @@ Handler_read_rnd_next	6003
 Handler_tmp_write	2000
 Handler_write	1000
 drop table t0,t1,t2,t3;
+#
+# MDEV-7971: Assertion `name != __null' failed in ACL_internal_schema_registry::lookup 
+#            on 2nd execution os PS with multi-table update
+#
+CREATE TABLE t1 (f1 INT);
+INSERT INTO t1 VALUES (1),(2);
+CREATE TABLE t2 (f2 INT);
+INSERT INTO t2 VALUES (3),(4);
+CREATE TABLE t3 (f3 INT);
+INSERT INTO t3 VALUES (5),(6);
+PREPARE stmt FROM '
+  UPDATE t1, t2 
+  SET f1 = 5
+  WHERE 8 IN ( SELECT MIN(f3) FROM t3 )
+';
+EXECUTE stmt;
+EXECUTE stmt;
+DROP TABLE t1,t2,t3;
 set @subselect_mat_test_optimizer_switch_value=null;
 set @@optimizer_switch='materialization=on,in_to_exists=off,semijoin=off';
 set optimizer_switch='mrr=on,mrr_sort_keys=on,index_condition_pushdown=on';
@@ -2477,4 +2541,19 @@ FROM t1;
 a	b	sq
 4	4	1
 4	2	1
+drop table t1, t2;
+#
+# MDEV-9489: Assertion `0' failed in Protocol::end_statement() on
+# UNION ALL
+#
+CREATE TABLE t1 (f1 INT);
+CREATE TABLE t2 (f2 INT);
+INSERT INTO t1 VALUES (1),(2);
+( SELECT 1 FROM t1 WHERE f1 NOT IN ( SELECT f2 FROM t2 ) LIMIT 0 )
+UNION ALL
+( SELECT 1 FROM t1 WHERE f1 NOT IN ( SELECT f2 FROM t2 ) )
+;
+1
+1
+1
 drop table t1, t2;

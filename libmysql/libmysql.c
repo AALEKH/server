@@ -47,9 +47,11 @@
 #include <sys/select.h>
 #endif
 #endif /* !defined(__WIN__) */
-#ifdef HAVE_POLL
+#if defined(HAVE_POLL_H)
+#include <poll.h>
+#elif defined(HAVE_SYS_POLL_H)
 #include <sys/poll.h>
-#endif
+#endif /* defined(HAVE_POLL_H) */
 #ifdef HAVE_SYS_UN_H
 #include <sys/un.h>
 #endif
@@ -1507,6 +1509,12 @@ my_bool cli_read_prepare_result(MYSQL *mysql, MYSQL_STMT *stmt)
     memory
 */
 
+#ifdef EMBEDDED_LIBRARY
+#define STMT_INIT_PREALLOC(S) 0
+#else
+#define STMT_INIT_PREALLOC(S) S
+#endif /*EMBEDDED_LIBRARY*/
+
 MYSQL_STMT * STDCALL
 mysql_stmt_init(MYSQL *mysql)
 {
@@ -1525,8 +1533,10 @@ mysql_stmt_init(MYSQL *mysql)
     DBUG_RETURN(NULL);
   }
 
-  init_alloc_root(&stmt->mem_root, 2048, 2048, MYF(MY_THREAD_SPECIFIC));
-  init_alloc_root(&stmt->result.alloc, 4096, 4096, MYF(MY_THREAD_SPECIFIC));
+  init_alloc_root(&stmt->mem_root, 2048, STMT_INIT_PREALLOC(2048),
+                  MYF(MY_THREAD_SPECIFIC));
+  init_alloc_root(&stmt->result.alloc, 4096, STMT_INIT_PREALLOC(4096),
+                  MYF(MY_THREAD_SPECIFIC));
   stmt->result.alloc.min_malloc= sizeof(MYSQL_ROWS);
   mysql->stmts= list_add(mysql->stmts, &stmt->list);
   stmt->list.data= stmt;
@@ -1542,6 +1552,8 @@ mysql_stmt_init(MYSQL *mysql)
 
   DBUG_RETURN(stmt);
 }
+
+#undef STMT_INIT_PREALLOC
 
 
 /*
@@ -2221,7 +2233,7 @@ static int stmt_read_row_buffered(MYSQL_STMT *stmt, unsigned char **row)
 
 /*
   Read one row from network: unbuffered non-cursor fetch.
-  If last row was read, or error occured, erase this statement
+  If last row was read, or error occurred, erase this statement
   from record pointing to object unbuffered fetch is performed from.
 
   SYNOPSIS

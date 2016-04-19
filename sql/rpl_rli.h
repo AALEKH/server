@@ -394,7 +394,7 @@ public:
   void close_temporary_tables();
 
   /* Check if UNTIL condition is satisfied. See slave.cc for more. */
-  bool is_until_satisfied(THD *thd, Log_event *ev);
+  bool is_until_satisfied(my_off_t);
   inline ulonglong until_pos()
   {
     DBUG_ASSERT(until_condition == UNTIL_MASTER_POS ||
@@ -415,15 +415,8 @@ public:
     Master log position of the event. The position is recorded in the
     relay log info and used to produce information for <code>SHOW
     SLAVE STATUS</code>.
-
-    @param event_creation_time
-    Timestamp for the creation of the event on the master side. The
-    time stamp is recorded in the relay log info and used to compute
-    the <code>Seconds_behind_master</code> field.
   */
-  void stmt_done(my_off_t event_log_pos,
-                 time_t event_creation_time, THD *thd,
-                 rpl_group_info *rgi);
+  void stmt_done(my_off_t event_log_pos, THD *thd, rpl_group_info *rgi);
   int alloc_inuse_relaylog(const char *name);
   void free_inuse_relaylog(inuse_relaylog *ir);
   void reset_inuse_relaylog();
@@ -676,6 +669,13 @@ struct rpl_group_info
   char gtid_info_buf[5+10+1+10+1+20+1];
 
   /*
+    The timestamp, from the master, of the commit event.
+    Used to do delayed update of rli->last_master_timestamp, for getting
+    reasonable values out of Seconds_Behind_Master in SHOW SLAVE STATUS.
+  */
+  time_t last_master_timestamp;
+
+  /*
     Information to be able to re-try an event group in case of a deadlock or
     other temporary error.
   */
@@ -745,7 +745,7 @@ struct rpl_group_info
   /**
     Save pointer to Annotate_rows event and switch on the
     binlog_annotate_row_events for this sql thread.
-    To be called when sql thread recieves an Annotate_rows event.
+    To be called when sql thread receives an Annotate_rows event.
   */
   inline void set_annotate_event(Annotate_rows_log_event *event)
   {
@@ -873,7 +873,7 @@ public:
 int init_relay_log_info(Relay_log_info* rli, const char* info_fname);
 
 
-extern struct rpl_slave_state rpl_global_gtid_slave_state;
+extern struct rpl_slave_state *rpl_global_gtid_slave_state;
 extern gtid_waiting rpl_global_gtid_waiting;
 
 int rpl_load_gtid_slave_state(THD *thd);
